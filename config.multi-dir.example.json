@@ -1,0 +1,24 @@
+{
+  "_comment": "다중 폴더 예시 — 한 에이전트(노드)가 여러 폴더를 병렬 감시한다. 각 폴더는 폴더명으로 자동 prefix 되어(test/..., khk/...) 파일명이 겹쳐도 충돌하지 않는다.",
+
+  "mode": "direct",
+  "token": "change-me-please-long-random-token",
+  "port": 8765,
+
+  "watch_dirs": [
+    "C:/test",
+    "C:/khk"
+  ],
+
+  "_comment_advanced": "라벨/recursive 를 폴더별로 지정하려면 객체 형태로:",
+  "_watch_dirs_advanced": [
+    { "dir": "C:/test", "label": "raw", "recursive": true },
+    { "dir": "C:/khk",  "label": "ingested", "recursive": false }
+  ],
+
+  "s3_endpoint": "http://10.1.55.225:28333",
+  "s3_bucket": "teresa-files",
+  "s3_access_key": "",
+  "s3_secret_key": "",
+  "s3_path_style": true
+}

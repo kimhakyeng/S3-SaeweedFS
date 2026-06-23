@@ -1,0 +1,15 @@
+{
+  "host": "0.0.0.0",
+  "port": 8765,
+  "token": "change-me-please-long-random-token",
+  "watch_dir": "C:/file-agent/watch",
+  "recursive": true,
+  "emit_existing_on_start": true,
+  "quiet_period_seconds": 0.5,
+  "compute_sha256": false,
+  "ws_enabled": true,
+  "ws_url": "http://localhost:3940",
+  "preflight_enabled": true,
+  "s3_endpoint": "http://10.1.55.225:28333",
+  "advertise_host": ""
+}

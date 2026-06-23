@@ -1,0 +1,4 @@
+watchdog>=4.0.0
+websocket-client>=1.8.0
+# SeaweedFS 직접 업로드 모드(config.json 에 s3_* 지정 시)에서만 필요.
+boto3>=1.34.0

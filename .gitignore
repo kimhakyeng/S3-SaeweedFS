@@ -1,16 +1,32 @@
-# Python
+# ===== Python =====
 __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
 venv/
 
-# 생성된 테스트 이미지/로그
+# ===== 빌드 결과물 (용량 큰 산출물 제외) =====
+build/
+build_new/
+dist/
+dist_new/
+*.exe
+*.zip
+*.pkg
+*.spec
+
+# ===== 생성된 테스트 이미지 / 로그 =====
 *.png
 img_*.png
 log/
 Images/
+agent.log
+events.jsonl
+ram_log.txt
 
-# OS
+# ===== 중복 클론 폴더 (file-agent 자체가 저장소이므로 제외) =====
+S3-SaeweedFS/
+
+# ===== OS =====
 .DS_Store
 Thumbs.db

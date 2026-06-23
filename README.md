@@ -1,7 +1,7 @@
 # File Generator
 
 CCTV/카메라 로그 구조를 흉내내어 이미지 파일을 대량 생성하는 테스트용 스크립트입니다.
-S3Agent 등 파일 감시·업로드 에이전트의 부하 및 RAM 과부하 테스트에 사용합니다.
+S3Agent(file-agent) 등 파일 감시·업로드 에이전트의 부하 및 RAM 과부하 테스트에 사용합니다.
 
 ## 기능
 
@@ -31,11 +31,11 @@ python file_generator.py
 
 더블클릭 실행 (Windows): `실행.bat`
 
-S3Agent 메모리 추적 (psutil 자동 설치): `실행_S3Agent추적.bat`
+S3Agent/file-agent 메모리 추적 (psutil 자동 설치): `실행_S3Agent추적.bat`
 
 ```
 pip install psutil
-python file_generator.py --watch-process S3Agent
+python file_generator.py --watch-process file-agent
 ```
 
 ## 옵션

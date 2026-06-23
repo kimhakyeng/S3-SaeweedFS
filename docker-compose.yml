@@ -1,0 +1,27 @@
+services:
+  file-agent:
+    build: .
+    image: file-agent:latest
+    container_name: file-agent
+    restart: unless-stopped      # 컨테이너 죽으면 자동 재시작 + 부팅 시 자동 시작
+    ports:
+      - "8765:8765"              # 호스트:컨테이너
+    volumes:
+      # 호스트 감시 폴더 → 컨테이너 /data/watch (백엔드 노드의 WatchDir = /data/watch)
+      - /home/dlit/agent-watch:/data/watch
+      # 영속화 (재시작 후 seq 유지)
+      - file-agent-state:/app/state
+      # config 직접 편집하고 싶으면 마운트 (선택 — 안 마운트하면 image 안의 default 사용)
+      - ./config.json:/app/config.json:ro
+    # 한국 시간
+    environment:
+      - TZ=Asia/Seoul
+    # 로그 회전 (10MB x 3)
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  file-agent-state:

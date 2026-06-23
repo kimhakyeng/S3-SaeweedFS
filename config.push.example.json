@@ -1,0 +1,12 @@
+{
+  "host": "0.0.0.0",
+  "port": 8765,
+  "token": "change-me-please-long-random-token",
+  "watch_dir": "C:/seaweed/data",
+  "recursive": true,
+  "emit_existing_on_start": true,
+  "quiet_period_seconds": 1.0,
+  "compute_sha256": false,
+  "push_enabled": true,
+  "push_url": "http://211.57.136.85:3939"
+}
