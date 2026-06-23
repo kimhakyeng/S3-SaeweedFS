@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 생성된 테스트 이미지/로그
+*.png
+img_*.png
+log/
+Images/
+
+# OS
+.DS_Store
+Thumbs.db
