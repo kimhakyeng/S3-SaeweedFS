@@ -114,24 +114,39 @@ def find_process_mem(name: str):
 
 # ----------------------------- 모니터 스레드 -----------------------------
 _stop = threading.Event()
-_peak = {"sys_pct": 0.0, "proc_mb": 0.0}
+_peak = {"sys_pct": 0.0, "procs": {}}
+
+# RAM 로그를 기록할 txt 파일 경로 (None 이면 기록 안 함)
+LOG_PATH = None
 
 
-def monitor_loop(interval: float, watch_process):
+def log(msg: str, also_print: bool = True):
+    """화면에 출력하고, LOG_PATH 가 설정돼 있으면 txt 파일에도 한 줄 추가."""
+    if also_print:
+        print(msg)
+    if LOG_PATH:
+        try:
+            with open(LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+        except OSError:
+            pass
+
+
+def monitor_loop(interval: float, watch_names):
     while not _stop.is_set():
         pct, used_mb, total_mb = get_system_mem()
         _peak["sys_pct"] = max(_peak["sys_pct"], pct)
-        line = (f"[RAM {datetime.now():%H:%M:%S}] 시스템 {pct:5.1f}% "
+        line = (f"[RAM {datetime.now():%Y-%m-%d %H:%M:%S}] 시스템 {pct:5.1f}% "
                 f"({used_mb:,.0f}/{total_mb:,.0f} MB)")
-        if watch_process:
-            res = find_process_mem(watch_process)
-            if res is None:
+        if watch_names:
+            if not psutil:
                 line += "  | (프로세스 추적엔 psutil 필요: pip install psutil)"
             else:
-                pmb, pc = res
-                _peak["proc_mb"] = max(_peak["proc_mb"], pmb)
-                line += f"  | '{watch_process}' x{pc}: {pmb:,.1f} MB (peak {_peak['proc_mb']:,.1f})"
-        print(line)
+                for nm in watch_names:
+                    pmb, pc = find_process_mem(nm)
+                    _peak["procs"][nm] = max(_peak["procs"].get(nm, 0.0), pmb)
+                    line += f"  | '{nm}' x{pc}: {pmb:,.1f} MB (peak {_peak['procs'][nm]:,.1f})"
+        log(line)
         _stop.wait(interval)
 
 
@@ -150,8 +165,8 @@ def purge_dir(d: str) -> int:
 # ----------------------------- 메인 -----------------------------
 def main() -> int:
     ap = argparse.ArgumentParser(description="CAM 폴더 이미지 생성기 + RAM 모니터 + 사이클")
-    ap.add_argument("--base", default=r"D:\log\Images\루미너스5x11",
-                    help=r"기본 경로 (기본 D:\log\Images\루미너스5x11)")
+    ap.add_argument("--base", nargs="+", default=[r"D:\log\Images\루미너스5x11"],
+                    help=r"기본 경로(여러 개 가능). 기본 D:\log\Images\루미너스5x11")
     ap.add_argument("--dates", nargs="+", default=["2026-06-22", "2026-06-23"],
                     help="날짜 폴더(여러 개, 기본 2026-06-22 2026-06-23)")
     ap.add_argument("--cams", type=int, default=6, help="CAM 폴더 개수 (기본 6 -> CAM1~CAM6)")
@@ -160,26 +175,41 @@ def main() -> int:
     ap.add_argument("--cycle-minutes", type=float, default=30, help="한 사이클 생성 시간(분), 기본 30")
     ap.add_argument("--no-purge", action="store_true", help="사이클마다 폴더를 비우지 않음")
     ap.add_argument("--mon-interval", type=float, default=5, help="RAM 출력 간격(초), 기본 5")
-    ap.add_argument("--watch-process", default=None, help="RAM 추적할 프로세스 이름(부분일치, psutil 필요)")
+    ap.add_argument("--watch-process", nargs="+", default=["file-agent"],
+                    help="RAM 추적할 프로세스 이름(여러 개 가능, 부분일치, psutil 필요). 기본 file-agent. 'off' 면 추적 안 함")
+    ap.add_argument("--log-file", default="ram_log.txt",
+                    help="RAM 기록을 저장할 txt 파일 (기본 ram_log.txt, 'off' 면 기록 안 함)")
     args = ap.parse_args()
+
+    # RAM 로그 파일 설정
+    global LOG_PATH
+    if args.log_file and args.log_file.lower() != "off":
+        LOG_PATH = os.path.abspath(args.log_file)
+
+    # 프로세스 추적 끄기
+    if args.watch_process and len(args.watch_process) == 1 and args.watch_process[0].lower() == "off":
+        args.watch_process = None
 
     # 모든 대상 CAM 폴더 경로 구성: base/date/CAMn
     targets = []
-    for date in args.dates:
-        for n in range(1, args.cams + 1):
-            targets.append(os.path.join(args.base, date, f"CAM{n}"))
+    for base in args.base:
+        for date in args.dates:
+            for n in range(1, args.cams + 1):
+                targets.append(os.path.join(base, date, f"CAM{n}"))
     for d in targets:
         os.makedirs(d, exist_ok=True)
 
     cycle_sec = args.cycle_minutes * 60
 
-    print(f"[시작] 기본경로: {args.base}")
-    print(f"[구조] 날짜 {args.dates} x CAM1~CAM{args.cams} = 총 {len(targets)}개 폴더")
-    print(f"[설정] 간격 {args.interval}s | 크기 {args.size}px | 사이클 {args.cycle_minutes}분 "
-          f"| 사이클 종료 시 삭제: {'아니오' if args.no_purge else '예'}")
-    print(f"[RAM ] psutil: {'있음' if psutil else '없음(시스템 RAM만)'} "
-          f"| 추적 프로세스: {args.watch_process or '없음'}")
-    print("[안내] 중지하려면 Ctrl+C\n")
+    log(f"\n==================== 실행 시작: {datetime.now():%Y-%m-%d %H:%M:%S} ====================")
+    log(f"[시작] 기본경로: {args.base}")
+    log(f"[구조] 날짜 {args.dates} x CAM1~CAM{args.cams} = 총 {len(targets)}개 폴더")
+    log(f"[설정] 간격 {args.interval}s | 크기 {args.size}px | 사이클 {args.cycle_minutes}분 "
+        f"| 사이클 종료 시 삭제: {'아니오' if args.no_purge else '예'}")
+    log(f"[RAM ] psutil: {'있음' if psutil else '없음(시스템 RAM만)'} "
+        f"| 추적 프로세스: {args.watch_process or '없음'}")
+    log(f"[로그] RAM 기록 파일: {LOG_PATH or '없음'}")
+    log("[안내] 중지하려면 Ctrl+C\n")
 
     mon = threading.Thread(target=monitor_loop, args=(args.mon_interval, args.watch_process), daemon=True)
     mon.start()
@@ -191,26 +221,29 @@ def main() -> int:
             cycle += 1
             made = 0
             t_cycle = time.perf_counter()
-            print(f"\n===== 사이클 {cycle} 생성 시작 ({args.cycle_minutes}분, 폴더 {len(targets)}개) =====")
+            log(f"\n===== 사이클 {cycle} 생성 시작 ({args.cycle_minutes}분, 폴더 {len(targets)}개) =====")
             while time.perf_counter() - t_cycle < cycle_sec:
                 t0 = time.perf_counter()
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-                # 모든 CAM 폴더에 각각 1개씩 (폴더마다 픽셀이 다른 이미지)
+                # 모든 CAM 폴더에 각각 1개씩 (파일명 = 각 파일의 생성 시각)
                 for d in targets:
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
                     with open(os.path.join(d, f"img_{ts}.png"), "wb") as f:
                         f.write(make_png(args.size, args.size))
                     made += 1
                     total_made += 1
                 elapsed = time.perf_counter() - t0
                 time.sleep(max(0.0, args.interval - elapsed))
-            print(f"----- 사이클 {cycle} 생성 종료: {made}개 (누적 {total_made}개) -----")
+            log(f"----- 사이클 {cycle} 생성 종료: {made}개 (누적 {total_made}개) -----")
             if not args.no_purge:
                 removed = sum(purge_dir(d) for d in targets)
-                print(f"----- 폴더 비움: {removed}개 삭제 -----")
+                log(f"----- 폴더 비움: {removed}개 삭제 -----")
     except KeyboardInterrupt:
         _stop.set()
-        print(f"\n[중지] 총 {total_made}개 생성 | 시스템 RAM peak {_peak['sys_pct']:.1f}%"
-              + (f" | 프로세스 peak {_peak['proc_mb']:,.1f} MB" if args.watch_process else ""))
+        peak_proc = ""
+        if args.watch_process:
+            peak_proc = " | " + ", ".join(
+                f"{nm} peak {_peak['procs'].get(nm, 0.0):,.1f} MB" for nm in args.watch_process)
+        log(f"\n[중지] 총 {total_made}개 생성 | 시스템 RAM peak {_peak['sys_pct']:.1f}%" + peak_proc)
         return 0
 
 
