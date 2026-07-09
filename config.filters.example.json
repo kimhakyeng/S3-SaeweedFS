@@ -1,0 +1,38 @@
+{
+  "_comment": "v1.2.0 수집 조건/방식 예시 — 전역 또는 watch_dirs 항목별로 지정. 노드(backend) 모드에선 노드 props 가 우선 적용됨.",
+
+  "mode": "backend",
+  "ws_url": "http://10.1.55.91:3940",
+  "token": "change-me-please-long-random-token",
+  "port": 8765,
+  "ws_senders": 6,
+  "ws_send_timeout": 60,
+
+  "_전역_필터": "아래 값은 모든 감시 폴더의 기본값. watch_dirs 항목에 같은 키를 쓰면 그 폴더만 오버라이드.",
+  "folder_include": ["CAM_*", "20[0-9][0-9]-*"],
+  "folder_exclude": ["temp", "_*", "backup*"],
+  "file_exclude": ["*.tmp", "~$*", "Thumbs.db"],
+  "ext_include": [],
+  "ext_exclude": ["tmp", "part", "crdownload"],
+  "min_file_size": "1KB",
+  "max_file_size": "500MB",
+
+  "_수집_방식": "collect_mode: realtime(실시간 감시)|batch(주기 스캔). rescan_interval_seconds: 보정 스캔 주기(0=끔).",
+  "collect_mode": "realtime",
+  "rescan_interval_seconds": 300,
+
+  "_무손실_메모리": "queue_max: 전송 대기 큐 상한. ack_timeout_seconds: 백엔드 적재 확인 재전송 대기.",
+  "queue_max": 20000,
+  "ack_timeout_seconds": 300,
+
+  "watch_dirs": [
+    { "dir": "C:/S3_TEST/루미너스" },
+    {
+      "dir": "C:/khktest/2026_07_06",
+      "collect_mode": "batch",
+      "batch_interval": 600,
+      "ext_include": ["jpg", "png"],
+      "max_file_size": "200MB"
+    }
+  ]
+}

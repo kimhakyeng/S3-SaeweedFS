@@ -44,8 +44,11 @@ Write-Host "[1/4] Installing deps (watchdog, websocket-client, boto3, pyinstalle
 if ($LASTEXITCODE -ne 0) { Write-Error "dependency install failed"; exit 1 }
 
 Write-Host "[2/4] PyInstaller build..." -ForegroundColor Cyan
+# Ensure work/output dirs exist (they may have been cleaned up).
+New-Item -ItemType Directory -Force -Path "build","dist" | Out-Null
 # boto3/botocore ship data files (endpoints.json etc.) -> collect-all so direct mode works.
-& $py -m PyInstaller --onefile --name file-agent `
+# --noconsole: true background daemon (no console window). Logs go to agent.log next to exe.
+& $py -m PyInstaller --onefile --noconsole --name file-agent `
     --collect-submodules watchdog `
     --collect-submodules websocket `
     --collect-all boto3 `
@@ -53,13 +56,20 @@ Write-Host "[2/4] PyInstaller build..." -ForegroundColor Cyan
     --distpath dist --workpath build --specpath build agent.py
 if ($LASTEXITCODE -ne 0) { Write-Error "build failed"; exit 1 }
 
-Write-Host "[3/4] Staging run files next to exe in dist..." -ForegroundColor Cyan
-# PyInstaller already produced dist\file-agent.exe. Keep only the run files beside it.
+Write-Host "[3/4] Staging run files next to exe in dist (minimal set)..." -ForegroundColor Cyan
+# Runtime needs only: file-agent.exe + config.json (+ install/uninstall helpers).
 if (-not (Test-Path "dist\config.json") -and (Test-Path "config.json")) {
     Copy-Item "config.json" "dist\config.json" -Force   # keep existing dist\config.json if present
 }
-foreach ($f in @("config.s3-direct.example.json","config.push.example.json","install.bat","uninstall.bat","install.ps1","uninstall.ps1","README.md")) {
+foreach ($f in @("install.bat","uninstall.bat")) {
     if (Test-Path $f) { Copy-Item $f (Join-Path "dist" $f) -Force }
+}
+# Remove files that are not needed at runtime (also cleans old stagings).
+foreach ($f in @("README.md","config.s3-direct.example.json","config.push.example.json",
+                 "config.folder-filter.example.json","config.multi-dir.example.json",
+                 "install.ps1","uninstall.ps1")) {
+    $p = Join-Path "dist" $f
+    if (Test-Path $p) { Remove-Item $p -Force -ErrorAction SilentlyContinue }
 }
 Get-ChildItem "dist" -Filter "_*.txt" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
 

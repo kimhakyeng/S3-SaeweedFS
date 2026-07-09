@@ -13,5 +13,14 @@ echo Installing file-agent ^(firewall + boot autostart^)...
 echo.
 file-agent.exe --install
 echo.
+echo Starting file-agent now...
+tasklist /FI "IMAGENAME eq file-agent.exe" | find /I "file-agent.exe" >nul
+if errorlevel 1 (
+  start "" "%~dp0file-agent.exe"
+  echo   file-agent started.
+) else (
+  echo   file-agent already running.
+)
+echo.
 echo Done. Press any key to close.
 pause >nul

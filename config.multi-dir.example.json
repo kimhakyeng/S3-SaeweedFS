@@ -19,6 +19,5 @@
   "s3_endpoint": "http://10.1.55.225:28333",
   "s3_bucket": "teresa-files",
   "s3_access_key": "",
-  "s3_secret_key": "",
-  "s3_path_style": true
+  "s3_secret_key": ""
 }

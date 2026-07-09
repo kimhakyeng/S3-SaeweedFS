@@ -10,6 +10,5 @@
   "ws_enabled": true,
   "ws_url": "http://localhost:3940",
   "preflight_enabled": true,
-  "s3_endpoint": "http://10.1.55.225:28333",
   "advertise_host": ""
 }
