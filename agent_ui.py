@@ -631,6 +631,8 @@ PS_COMMON = [
     "      try { $sid = $r.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch {}",
     "      if (@('S-1-5-32-545', 'S-1-5-11', 'S-1-1-0', 'S-1-3-0') -notcontains $sid) { continue }",
     "      if (([int]$r.FileSystemRights -band 0x500D0156) -ne 0) { $bad += ($r.IdentityReference.Value + ' ' + $r.FileSystemRights) }",
+    # 파일로 상속되는 항목이 있으면 일반 사용자가 로그·원장·새 설정 파일을 읽을 수 있다.
+    "      elseif (($r.InheritanceFlags -band [Security.AccessControl.InheritanceFlags]::ObjectInherit) -ne 0 -and $sid -ne 'S-1-3-0') { $bad += ($r.IdentityReference.Value + ' 파일 읽기(상속)') }",
     "    }",
     "    $ownerBad = @()",
     "    foreach ($n in @('file-agent.exe', 'file-agent-ui.exe')) {",

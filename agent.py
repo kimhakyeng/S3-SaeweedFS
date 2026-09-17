@@ -3131,6 +3131,15 @@ def user_stop_active(base: str) -> bool:
         flag_boot = 0.0
     now_boot = _boot_epoch()
     if flag_boot and now_boot and abs(now_boot - flag_boot) < 120:
+        if not data.get("logged"):
+            # 수집이 멈춘 이유가 로그에 보이도록 [중지] 한 번에 한 줄만 남긴다(5분마다 반복 기록하지 않음).
+            log.warning("[중지] 상태라 자동 실행을 건너뜁니다 — UI 에서 [시작]을 누르거나 PC 를 다시 시작하면 돕니다.")
+            try:
+                data["logged"] = True
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(json.dumps(data))
+            except OSError:
+                pass
         return True
     try:
         os.remove(path)
@@ -3208,6 +3217,8 @@ def _harden_install_dir_ps() -> str:
               실행에 필요한 exe·bat·템플릿·BUILD-INFO 에만 Users 읽기/실행을 따로 준다.
       · OWNER RIGHTS 를 읽기/실행으로 제한 — 압축을 푼 일반 사용자가 소유자여도 권한을 바꿀 수 없다.
       · 소유자는 Administrators (폴더와 바로 아래 파일만 — 하위 폴더는 재귀하지 않는다).
+      · 기존에 부여된 Users·Authenticated Users·Everyone·OWNER RIGHTS·CREATOR OWNER 항목은 먼저 지운다 —
+        icacls /grant:r 은 상속 플래그가 다른 기존 항목((OI)(CI) 등)을 남겨 로그·원장이 읽히게 된다(2026-09-17 실측).
       · 하위 폴더가 있으면(옛 기본 감시 폴더 등) 먼저 현재 권한을 고정(/inheritance:d)해,
         그 폴더에 쓰는 프로그램은 그대로 쓸 수 있게 한다.
     icacls 오류는 로컬 EAP=Continue 에서 2>&1 로 받아 결과에 남긴다(PS 5.1 에서 EAP=Stop 과 섞지 않는다).
@@ -3221,6 +3232,8 @@ def _harden_install_dir_ps() -> str:
         "if($LASTEXITCODE -ne 0){$fail+=('하위 폴더 '+$d.Name+': '+($o -join ' '))}"
         "else{Write-Host ('acl: 하위 폴더 권한 고정 — '+$d.Name)}"
         "};"
+        "$o=& icacls.exe $work /remove:g '*S-1-5-32-545' '*S-1-5-11' '*S-1-1-0' '*S-1-3-4' '*S-1-3-0' 2>&1 | ForEach-Object {\"$_\"};"
+        "if($LASTEXITCODE -ne 0){$fail+=('기존 권한 정리: '+($o -join ' '))}"
         "$o=& icacls.exe $work /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F'"
         " '*S-1-5-32-545:(CI)RX' '*S-1-3-4:(OI)(CI)RX' 2>&1 | ForEach-Object {\"$_\"};"
         "if($LASTEXITCODE -ne 0){$fail+=('폴더: '+($o -join ' '))}"
