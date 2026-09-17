@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-file-agent : 디렉터리 감시 + 이벤트/파일 노출 데몬 (Pull 모델)
+file-agent : 디렉터리 감시 → TERESA MQ 백엔드(또는 S3)로 무손실 전송하는 데몬
 
-[역할]  로컬 PC(예: 10.1.55.91)에서 실행.
-  1) 지정한 디렉터리를 감시(watchdog)하여 새 파일 생성/이동(드롭)을 감지
-  2) HTTP 포트를 하나 열어, 가져가는 쪽(teresaMqback / 225 서버)이
-     - 파일 생성 "이벤트"를 구독(SSE) 또는 폴링하고
-     - 해당 "파일 내용"을 다운로드
-     할 수 있게 노출한다.
+[역할]  현장 PC 에서 실행한다(Windows 에서는 작업 스케줄러의 SYSTEM 작업).
+  1) 지정한 디렉터리를 감시(watchdog + 주기 보정 스캔)하여 새 파일·수정을 감지
+  2) 전송
+     - backend 모드(기본): 백엔드에 WebSocket 으로 붙어 파일을 보내고, 적재 확인(ack)을
+       받은 파일만 원장(sent.jsonl)에 기록한다. 감시 폴더는 캔버스 노드가 내려준다.
+     - direct 모드: S3 에 직접 업로드한다.
+     - PULL 모드(옛 방식): HTTP 포트로 이벤트(SSE)·파일을 노출하고 백엔드가 가져간다.
+  3) 127.0.0.1 HTTP 포트로 상태(/health)와 제어(/control)를 제공한다(컨트롤 UI 가 사용).
 
-Linux / Windows 공통으로 동작. 표준 라이브러리 + watchdog 만 사용.
-
-자세한 HTTP API 규격은 README.md 참고.
+Linux / Windows 공통으로 동작. 사용법은 README.md 참고.
 """
 
 from __future__ import annotations
@@ -38,19 +38,46 @@ from urllib.parse import urlparse, parse_qs, urlencode
 
 try:
     from watchdog.observers import Observer
+    from watchdog.observers.api import ObservedWatch
     from watchdog.events import FileSystemEventHandler
-except ImportError:
-    sys.stderr.write("watchdog 가 필요합니다.  pip install watchdog\n")
-    raise
+except ImportError as _imp_err:  # pragma: no cover - 배포본에는 항상 들어 있다
+    _here = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
+    try:
+        with open(os.path.join(_here, "agent-crash.log"), "a", encoding="utf-8") as _f:
+            _f.write("[%s] watchdog import 실패: %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), _imp_err))
+    except OSError:
+        pass
+    if sys.stderr is not None:
+        sys.stderr.write("watchdog 가 필요합니다.  pip install watchdog\n")
+    sys.exit(1)
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 
 log = logging.getLogger("file-agent")
+_PROCESS_STARTED_AT = time.time()
+
+# 배포 템플릿(config.template.json)의 자리표시 토큰. 이 값이나 빈 값으로는 백엔드 모드를 켜지 않는다.
+# zip 에 공개된 값이라, 그대로 두면 같은 LAN 의 누구나 이 데몬과 백엔드 노드에 붙을 수 있다.
+PLACEHOLDER_TOKEN = "change-me-please-long-random-token"
+
+# UI 의 [중지] 가 남기는 표식. 작업 스케줄러의 5분 감시 트리거가 사용자가 멈춘 데몬을
+# 곧바로 되살리지 않게 한다. 기록된 부팅 시각이 지금 부팅과 다르면(재부팅) 무시하고 지운다.
+STOP_FLAG_NAME = "stopped.flag"
 
 
 # ============================================================================
 #  네트워크 도달성 헬퍼 (프리플라이트용)
 # ============================================================================
+# 백엔드로 가는 HTTP 호출(프리플라이트·push·config 폴링)은 WS 연결(websocket-client)과 같은
+# 프록시 기준을 쓴다 — 환경 변수(http_proxy 등)만 보고 Windows 사용자 프록시(레지스트리)는 보지 않는다.
+# 기준이 다르면 사내 프록시가 설정된 PC 에서 프리플라이트만 프록시로 나가 실패하고 WS 는 영영 열리지 않는다.
+_URL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler(urllib.request.getproxies_environment()))
+
+
+def _url_open(req, timeout: float):
+    return _URL_OPENER.open(req, timeout=timeout)
+
+
 def _split_host_port(url_or_hostport: str, default_port: int = 80) -> tuple[str, int]:
     """http://host:port 또는 host:port 문자열에서 (host, port) 추출."""
     s = (url_or_hostport or "").strip()
@@ -313,12 +340,12 @@ class Config:
         # ── PUSH 모드 ──
         # push_enabled=true 면, 파일 변경 시 backend 로 직접 POST 한다 (외부망/NAT 뒤 데몬용).
         # backend 가 데몬에 접근 못 하는 환경에서 PULL 대신 사용. PULL 과 동시 사용도 무방.
-        # push_url 예) http://211.57.136.85:3939  (backend 공인 주소, 끝 슬래시 제외)
+        # push_url 예) http://203.0.113.10:3939  (backend 공인 주소, 끝 슬래시 제외)
         self.push_enabled: bool = bool(d.get("push_enabled", False))
         self.push_url: str = str(d.get("push_url", "")).rstrip("/")
         # ── WS 모드 (양방향) ──
         # ws_enabled=true 면 backend 와 WebSocket 으로 양방향 통신 (파일 업로드 + 역방향 삭제).
-        # 데몬이 WS 클라이언트로 outbound 연결하므로 내부/외부망(NAT) 무관. ws_url 예) http://10.1.55.225:3940
+        # 데몬이 WS 클라이언트로 outbound 연결하므로 내부/외부망(NAT) 무관. ws_url 예) http://192.0.2.10:3940
         self.ws_enabled: bool = bool(d.get("ws_enabled", False))
         self.ws_url: str = str(d.get("ws_url", "")).rstrip("/")
         # 병렬 전송 연결 수. 1=기존 동작(직렬). 0.3초 고빈도 환경에선 4~8 권장(처리량↑, 누락↓).
@@ -349,6 +376,20 @@ class Config:
         #   "동시에 디스크에 둘 수 있는 최대 파일 수"보다 크게 잡아야 초과분 재전송이 없다.
         #   항목당 ~350바이트(한글 경로). 예) 500만=약 1.6GB RAM/0.56GB 디스크. 재기동 시 tail 만큼 로드.
         self.ledger_keep_in_memory: int = max(10_000, int(d.get("ledger_keep_in_memory", 300_000)))
+        # sync_mode (ADR-022): 개별 플래그 대신 "speed"(기본) | "mirror" 2개 프리셋으로 단순화.
+        #   speed  : 삭제 이벤트는 로컬 캐시 정리만 하고 어디로도 전송하지 않는다 — 기존 동작과
+        #            100% 동일. 100만 장급 대량 초기적재처럼 "전송만 하고 끝"이면 되는 시나리오.
+        #   mirror : 삭제 이벤트를 실시간(watchdog)·배치(원장 컴팩션) 양쪽에서 저우선순위 채널로
+        #            백엔드에 계속 전송해 감시 디렉터리와 스토리지가 실시간으로 맞물리게 한다.
+        #   최신 Teresa 연결 시 Agent Source syncMode가 런타임 값을 자동 제어한다.
+        #   같은 token에 mirror Binding이 하나라도 있으면 삭제 이벤트를 발신하고, 실제 삭제/덮어쓰기는
+        #   백엔드가 각 Binding의 speed/mirror 정책으로 최종 분할한다.
+        #   알 수 없는 값은 안전한 speed 로 폴백(+경고 로그).
+        _sync_mode_raw = str(d.get("sync_mode", "speed")).strip().lower()
+        if _sync_mode_raw not in ("speed", "mirror"):
+            log.warning("sync_mode 값 인식 불가(%r) — 'speed' 로 폴백", _sync_mode_raw)
+            _sync_mode_raw = "speed"
+        self.sync_mode: str = _sync_mode_raw
         # ── 수집 파일 조건 (전역 기본값 — watch_dirs 항목별로 개별 지정 시 그쪽이 우선) ──
         #   folder_include/folder_exclude : 폴더명 fnmatch 패턴 (기존과 동일)
         #   file_include/file_exclude     : 파일명 fnmatch 패턴 (예: ["*.tmp", "~$*"])
@@ -383,7 +424,7 @@ class Config:
         # ws 모드에서 WS 를 열기 전에 양방향 도달성을 먼저 확인한다(무작정 WS 재연결 방지).
         #  - preflight_enabled : 사전 점검 사용 여부(기본 true).
         #  - s3_endpoint       : SeaweedFS S3 엔드포인트. 에이전트→스토리지 직접 도달성 확인용.
-        #                        예) http://10.1.55.225:28333  (비우면 해당 확인 생략)
+        #                        예) http://192.0.2.10:28333  (비우면 해당 확인 생략)
         #  - advertise_host    : backend 가 이 PC 로 역방향 접근할 때 쓸 IP. 비우면 자동 감지.
         self.preflight_enabled: bool = bool(d.get("preflight_enabled", True))
         self.s3_endpoint: str = str(d.get("s3_endpoint", "")).rstrip("/")
@@ -533,6 +574,18 @@ class Config:
                 continue
         return None
 
+    def resolve_for_compaction(self, relpath: str) -> str | None:
+        """원장 정리용 resolve. 감시 폴더 자체가 지금 안 보이면 ""(판단 보류)를 돌려준다.
+        부팅 직후 네트워크 공유·외장 디스크가 덜 붙은 순간에 '파일 없음'으로 보고
+        원장을 지우면, 폴더가 돌아왔을 때 전부 다시 보내게 된다."""
+        ap = self.resolve(relpath)
+        if ap is None:
+            return None
+        w = self._find_watch(ap)
+        if w is not None and not os.path.isdir(w.path):
+            return ""
+        return ap
+
     def _find_watch(self, abspath: str) -> "Watch | None":
         """절대경로가 속한 가장 구체적인(긴 base) Watch 를 찾는다. 없으면 None."""
         ap = os.path.realpath(abspath)
@@ -586,8 +639,13 @@ class Config:
             walker = (os.path.join(r, fn)
                       for r, _, fs in os.walk(base) for fn in fs)
         else:
+            try:
+                names = os.listdir(base)
+            except OSError as e:
+                log.warning("감시 폴더를 읽을 수 없습니다(이번 스캔 건너뜀): %s — %s", base, e)
+                return
             walker = (os.path.join(base, fn)
-                      for fn in os.listdir(base)
+                      for fn in names
                       if os.path.isfile(os.path.join(base, fn)))
         for ap in walker:
             if not self.file_allowed(ap):
@@ -629,7 +687,8 @@ class Config:
 
     @staticmethod
     def load(path: str) -> "Config":
-        with open(path, "r", encoding="utf-8") as f:
+        # utf-8-sig: PowerShell Set-Content -Encoding UTF8·옛 메모장이 붙이는 BOM 을 허용한다.
+        with open(path, "r", encoding="utf-8-sig") as f:
             raw = f.read()
         # JSONC 허용: // , /* */ 주석과 trailing comma 제거 후 파싱
         return Config(json.loads(_strip_jsonc(raw)))
@@ -863,24 +922,39 @@ class SentLedger:
             except OSError:
                 pass
 
-    def compact(self, resolver) -> tuple[int, int]:
+    def compact(self, resolver, on_dropped=None) -> tuple[int, int]:
         """원장을 '현재 watch 스코프 안 & 디스크에 실제 존재' 항목만으로 축소한다(ADR-019).
         resolver(relpath) -> 절대경로|None (Config.resolve). None 이거나 파일이 없으면 제거.
         - 소스가 사라진(작업자 용량정리 삭제) / 스코프 밖(WatchDir 축소) 항목을 걷어내
           원장·시작메모리·디스크를 '현존 파일 수'로 상한시킨다. S3/백엔드 무왕복(로컬만).
         - 안전: '디스크에 없는' 항목만 제거 → 현존 파일의 재전송을 유발하지 않음(무손실 불변식 무관).
-        - 락 최소화: 느린 디스크 stat 은 락 밖에서 수행."""
+        - 락 최소화: 느린 디스크 stat 은 락 밖에서 수행.
+        - on_dropped(relpath) (ADR-022, 선택): 제거된 각 항목에 대해 호출 — batch collect_mode 처럼
+          watchdog 이 없어 on_deleted 가 못 잡는 삭제를 sync_mode=mirror 에서 대신 통지하는 용도.
+          None(기본)이면 호출 안 함 — 기존 동작과 100% 동일. 락 해제 후 호출(재진입 안전)."""
         with self._lock:
             items = list(self._map.items())
         dropped_keys: list[str] = []
+        missing_keys: list[str] = []   # 디스크에서 사라진 것만 — 삭제 통지 대상
+        out_of_scope = 0
         for p, _v in items:
             try:
                 ap = resolver(p)
             except Exception:  # noqa: BLE001
-                ap = None
-            if ap is None or not os.path.exists(ap):
+                continue   # 판단할 수 없으면 지우지 않는다
+            if ap == "":
+                continue   # 감시 폴더가 지금 안 보임 — 판단 보류
+            if ap is None:
+                out_of_scope += 1
                 dropped_keys.append(p)
+            elif not os.path.exists(ap):
+                dropped_keys.append(p)
+                missing_keys.append(p)
         if not dropped_keys:
+            return (len(items), 0)
+        if items and out_of_scope == len(items):
+            # 전부 범위 밖이면 감시 구성이 아직 덜 정해졌을 가능성이 크다. 지우지 않는다.
+            log.warning("원장 정리 보류: 기록 %d건이 모두 현재 감시 폴더 밖입니다", len(items))
             return (len(items), 0)
         with self._lock:
             for k in dropped_keys:
@@ -901,7 +975,16 @@ class SentLedger:
                         os.remove(tmp)
                 except OSError:
                     pass
-            return (len(self._map), len(dropped_keys))
+            kept = len(self._map)
+        if on_dropped is not None:
+            # 감시 범위에서 빠졌을 뿐인 항목(엣지 해제·라벨 변경)은 로컬에 파일이 남아 있다.
+            # 이것을 삭제로 알리면 mirror 노드가 S3 객체를 지운다 — 디스크에서 사라진 것만 알린다.
+            for k in missing_keys:
+                try:
+                    on_dropped(k)
+                except Exception:  # noqa: BLE001
+                    pass
+        return (kept, len(dropped_keys))
 
     def __len__(self) -> int:
         with self._lock:
@@ -962,6 +1045,7 @@ class PushClient(threading.Thread):
         super().__init__(daemon=True)
         self.push_url = push_url.rstrip("/")
         self.token = token
+        self.on_fail = None   # abspath -> None. main 에서 runtime.forget_emitted 를 넣는다.
         self._q: "queue.Queue[tuple | None]" = queue.Queue()
         self._stop = threading.Event()
 
@@ -982,7 +1066,15 @@ class PushClient(threading.Thread):
             try:
                 self._send(ev_type, relpath, abspath)
             except Exception as e:  # noqa: BLE001
-                log.warning("push 실패 (%s %s): %s", ev_type, relpath, e)
+                log.warning("push 실패 (%s %s): %s — 다음 보정 스캔 때 다시 시도", ev_type, relpath, e)
+                self._failed(abspath)
+
+    def _failed(self, abspath: str | None) -> None:
+        if self.on_fail is not None and abspath:
+            try:
+                self.on_fail(abspath)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _send(self, ev_type: str, relpath: str, abspath: str | None) -> None:
         # deleted 또는 파일 없음 → 빈 본문. 그 외 → 파일 바이트 적재.
@@ -1009,13 +1101,14 @@ class PushClient(threading.Thread):
         last_err: Exception | None = None
         for attempt in range(3):
             try:
-                with urllib.request.urlopen(req, timeout=30) as resp:
+                with _url_open(req, timeout=30) as resp:
                     log.info("push OK [%s] %s → HTTP %s", ev_type, relpath, resp.getcode())
                     return
             except urllib.error.HTTPError as he:
                 # 404 = 활성 push 엣지 없음(아직 미활성). 재시도해도 동일하므로 한 번만 알리고 종료.
                 if he.code == 404:
-                    log.info("push 대기 [%s] %s — 활성 push 엣지 없음(엣지 활성화 후 다시 시도됨)", ev_type, relpath)
+                    log.info("push 대기 [%s] %s — 활성 push 엣지 없음(다음 보정 스캔 때 다시 시도)", ev_type, relpath)
+                    self._failed(abspath)
                     return
                 last_err = he
             except Exception as e:  # noqa: BLE001
@@ -1059,14 +1152,24 @@ class WsClient(threading.Thread):
             wsbase = base
         q = urlencode({"token": token}) if token else ""
         self.ws_url = wsbase + "/api/file-agent/ws" + (("?" + q) if q else "")
+        # 로그용 — 토큰은 절대 기록하지 않는다(로그는 설치 폴더에 남고 지원 요청 때 밖으로 나간다).
+        self._log_url = wsbase + "/api/file-agent/ws" + ("?token=***" if token else "")
         # 프리플라이트는 http(s) 로 호출하므로 원본 http base 를 보관한다.
-        self.http_base = base if base.startswith(("http://", "https://")) else ("http://" + base)
+        if base.startswith(("http://", "https://")):
+            self.http_base = base
+        elif base.startswith("wss://"):
+            self.http_base = "https://" + base[len("wss://"):]
+        elif base.startswith("ws://"):
+            self.http_base = "http://" + base[len("ws://"):]
+        else:
+            self.http_base = "http://" + base
         self.token = token
         self.runtime = runtime
         self.cfg = cfg
         self._q: "queue.Queue[tuple | None]" = shared_q if shared_q is not None else queue.Queue()
         self._ws = None
         self._connected = threading.Event()
+        self._welcome = threading.Event()   # 이번 연결에서 welcome(기능 협상)을 받았는지
         self._stop = threading.Event()
         self._send_lock = threading.Lock()
         # send 타임아웃(초). 백엔드 정체로 TCP 송신버퍼가 차도 send 가 무한 블록되지 않게 한다.
@@ -1090,14 +1193,19 @@ class WsClient(threading.Thread):
         except ImportError:
             log.error("ws_enabled=true 이지만 websocket-client 가 없습니다.  pip install websocket-client")
             return
-        log.info("WS 모드 활성: %s", self.ws_url)
+        log.info("WS 모드 활성: %s", self._log_url)
         threading.Thread(target=self._sender_loop, daemon=True).start()
         backoff = 1.0
         while not self._stop.is_set():
             # ── 프리플라이트 게이트 ──
             # 양방향 도달성(에이전트→SeaweedFS, 백엔드→에이전트 등)이 확인돼야 WS 를 연다.
             # 실패하면 WS 를 열지 않고 백오프 후 재점검(무작정 WS 재연결 방지).
-            if not self._preflight():
+            try:
+                passed = self._preflight()
+            except Exception as e:  # noqa: BLE001  여기서 예외가 새면 이 스레드가 조용히 죽어 영영 연결하지 않는다
+                log.warning("프리플라이트 점검 중 오류: %s", e)
+                passed = False
+            if not passed:
                 log.info("프리플라이트 미통과 — %.0fs 후 재점검 (WS 미연결)", backoff)
                 self._stop.wait(backoff)
                 backoff = min(backoff * 2, 30.0)
@@ -1123,18 +1231,21 @@ class WsClient(threading.Thread):
             backoff = min(backoff * 2, 30.0)
 
     def _preflight(self) -> bool:
-        """WS 를 열기 전 양방향 도달성을 확인한다.
-          1) 에이전트 → SeaweedFS(직접): cfg.s3_endpoint 로 TCP 도달.
+        """WS 를 열기 전 도달성을 확인한다.
+          1) 에이전트 → SeaweedFS(직접): cfg.s3_endpoint 로 TCP 도달. direct 모드만 — backend 모드는
+             파일을 WS 로 백엔드에 넘기고 S3 적재는 백엔드가 하므로 에이전트가 S3 에 닿을 필요가 없다.
           2) 에이전트 → 백엔드          : 프리플라이트 요청이 도달하는지(= 호출 성공).
-          3) 백엔드 → 에이전트:port/health : 백엔드가 응답으로 알려줌(backendToAgent).
+          3) 백엔드 → 에이전트:port/health : 백엔드가 응답으로 알려줌(backendToAgent). 참고값 — 게이트 아님.
+             WS 는 에이전트가 먼저 연결하므로 역방향이 필요 없고, 외부망(NAT 뒤)에선 원래 막혀 있다.
           4) 백엔드 → SeaweedFS          : 백엔드가 응답으로 알려줌(backendToSeaweed).
-        모두 통과해야 True. cfg 없거나 preflight_enabled=false 면 점검 생략(True)."""
+        1·2·4 가 통과하면 True. cfg 없거나 preflight_enabled=false 면 점검 생략(True).
+        (2026-09-15 전에는 1·3 도 게이트여서 외부망에선 WS 를 영원히 못 열었다.)"""
         cfg = self.cfg
         if cfg is None or not getattr(cfg, "preflight_enabled", True):
             return True
 
-        # 1) 에이전트 → SeaweedFS 직접 도달성
-        if cfg.s3_endpoint:
+        # 1) 에이전트 → SeaweedFS 직접 도달성 (direct 모드만)
+        if cfg.s3_endpoint and cfg.s3_direct_enabled:
             sh, sp = _split_host_port(cfg.s3_endpoint, 80)
             if not _tcp_reachable(sh, sp, timeout=3.0):
                 log.warning("프리플라이트: 에이전트→SeaweedFS 도달 실패 (%s)", cfg.s3_endpoint)
@@ -1145,22 +1256,27 @@ class WsClient(threading.Thread):
         backend_host, _ = _split_host_port(self.http_base, 80)
         adv_host = cfg.advertise_host or _detect_local_ip(backend_host)
         params = {"host": adv_host, "port": str(cfg.port)}
-        if cfg.s3_endpoint:
+        # s3_endpoint 는 direct 모드 전용 값이다. backend 모드에선 S3 적재를 백엔드가 캔버스 노드 주소로 하므로
+        # 여기 남아 있는 값은 무관하다. 그런데도 넘기면 백엔드가 그 주소 도달성을 검사하고, 못 닿으면
+        # backendToSeaweed=false 가 되어 WS 를 영원히 열지 않는다(다른 사이트 백엔드에 붙을 때 실제로 막힘).
+        if cfg.s3_endpoint and cfg.s3_direct_enabled:
             params["s3Endpoint"] = cfg.s3_endpoint
         url = self.http_base + "/api/file-agent/preflight?" + urlencode(params)
         try:
             req = urllib.request.Request(url, method="GET")
             if self.token:
                 req.add_header("X-Agent-Token", self.token)
-            with urllib.request.urlopen(req, timeout=5.0) as resp:
+            with _url_open(req, timeout=5.0) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
         except Exception as e:  # noqa: BLE001
             log.warning("프리플라이트: 에이전트→백엔드 호출 실패 (%s) — %s", url, e)
             return False
 
-        ok = bool(data.get("ok"))
-        log.info("프리플라이트: 백엔드 응답 ok=%s (backendToAgent=%s, backendToSeaweed=%s, advHost=%s:%s)",
-                 ok, data.get("backendToAgent"), data.get("backendToSeaweed"), adv_host, cfg.port)
+        # 백엔드의 ok 는 구버전에서 backendToAgent 까지 묶여 있어 그대로 믿지 않는다 — 4) 만 게이트로 본다.
+        # backendToSeaweed 가 null(= s3Endpoint 안 보냄)이면 통과.
+        ok = data.get("backendToSeaweed") is not False
+        log.info("프리플라이트: 통과=%s (backendToSeaweed=%s, backendToAgent=%s[참고], 백엔드 ok=%s, advHost=%s:%s)",
+                 ok, data.get("backendToSeaweed"), data.get("backendToAgent"), data.get("ok"), adv_host, cfg.port)
         return ok
 
     def _on_open(self, ws) -> None:
@@ -1173,8 +1289,19 @@ class WsClient(threading.Thread):
                 ws.sock.settimeout(self.send_timeout)
         except Exception as e:  # noqa: BLE001
             log.debug("WS 소켓 타임아웃 설정 실패(무시): %s", e)
-        self._connected.set()
-        log.info("WS 연결됨: %s (send_timeout=%.0fs)", self.ws_url, self.send_timeout)
+        # ★ 전송은 welcome(ack 지원 여부)을 받은 뒤 시작한다. 먼저 보내면 ack 모드가 꺼진 채
+        #   나간 파일은 원장에 기록되지 않아 재기동 때마다 다시 보낸다.
+        #   welcome 을 보내지 않는 구버전 백엔드를 위해 2초 뒤에는 그냥 시작한다.
+        self._welcome.clear()
+        ws_ref = ws
+
+        def _open_gate():
+            self._welcome.wait(2.0)
+            if self._ws is ws_ref and not self._stop.is_set():
+                self._connected.set()
+
+        threading.Thread(target=_open_gate, daemon=True, name=f"ws-gate{self.idx}").start()
+        log.info("WS 연결됨: %s (send_timeout=%.0fs)", self._log_url, self.send_timeout)
 
     def _on_close(self, ws, code, msg) -> None:
         self._connected.clear()
@@ -1198,9 +1325,17 @@ class WsClient(threading.Thread):
             #   연결이 끊기고 → 재연결 → 재전송 → 재적용… 폭풍이 생긴다. (동일 구성은 noop)
             wd = str(m.get("watchDir", "")).strip()
             wds = m.get("watchDirs")
+            requested_sync_mode = str(m.get("syncMode", "")).strip().lower()
+            if requested_sync_mode not in ("speed", "mirror"):
+                requested_sync_mode = ""
+            reconcile_id = str(m.get("reconcileId", "")).strip()
 
             def _apply_watch_cmd():
                 try:
+                    if requested_sync_mode and self.runtime.cfg.sync_mode != requested_sync_mode:
+                        previous_mode = self.runtime.cfg.sync_mode
+                        self.runtime.cfg.sync_mode = requested_sync_mode
+                        log.info("WS: Teresa syncMode 적용: %s → %s", previous_mode, requested_sync_mode)
                     if wds:  # 명시적 배열로 온 경우 (str|dict 혼용 허용 — dict 는 그대로 전달)
                         parts = []
                         for p in wds:
@@ -1214,10 +1349,19 @@ class WsClient(threading.Thread):
                         result = self.runtime.apply_watch_spec(wd)
                     else:
                         return
-                    if result.get("status") == "noop":
+                    status = result.get("status")
+                    if status == "noop":
                         log.debug("WS: set_watch_dirs 동일 구성 — noop")
                     else:
                         log.info("WS: backend set_watch_dir(s) 적용 → %s", result)
+                    if status in ("ok", "noop"):
+                        # 이제 감시 범위는 백엔드가 정한 값이다 — 원장 정리를 허용한다.
+                        self.runtime.scope_ready = True
+                        # 구성은 같아도 엣지가 새로 켜졌을 수 있다. 앞서 '받을 노드 없음'으로
+                        # 돌아온 파일만 다시 보내게 한다(전체 재스캔은 하지 않음).
+                        self.runtime.retry_unmatched()
+                    if requested_sync_mode == "mirror" and reconcile_id:
+                        self.runtime.reconcile_existing(reconcile_id)
                 except Exception as e:  # noqa: BLE001
                     log.warning("set_watch_dir(s) 실패: %s", e)
 
@@ -1240,6 +1384,7 @@ class WsClient(threading.Thread):
             if "ack" in feats and not self.runtime.ack_enabled:
                 self.runtime.ack_enabled = True
                 log.info("WS: 백엔드 ack/offer 지원 감지 — 무손실 확인응답 모드 활성")
+            self._welcome.set()
         elif t == "file_want":
             p = str(m.get("path", ""))
             self._offer_verdicts[p] = "want"
@@ -1264,6 +1409,10 @@ class WsClient(threading.Thread):
             if result in ("stored", "exists") and rec is not None and self.runtime.ledger is not None:
                 # rec = (ev_type, abspath, size, mtime, sent_ts)
                 self.runtime.ledger.record(p, rec[2], rec[3])
+            elif rec is not None and result != "filtered":
+                # unmatched(받을 노드 없음) 등 — 적재되지 않았다. '보낸 것'으로 남겨 두면
+                # 재기동 전까지 다시 보내지 않으므로 기억을 지우고 재시도 대상에 올린다.
+                self.runtime.note_unmatched(p, rec[1])
         elif t == "pong":
             pass
 
@@ -1348,7 +1497,9 @@ class WsClient(threading.Thread):
             if verdict != "want":
                 if verdict in ("exists", "stored") and self.runtime.ledger is not None:
                     self.runtime.ledger.record(relpath, size, st.st_mtime)
-                log.info("WS 오퍼 스킵 [%s] %s (result=%s)", ev_type, relpath, verdict)
+                elif verdict != "filtered":
+                    self.runtime.note_unmatched(relpath, abspath)
+                log.debug("WS 오퍼 스킵 [%s] %s (result=%s)", ev_type, relpath, verdict)
                 return
 
         # ack 모드: ★전송 시작 "전에" pending 등록★ — 소파일은 file_end 직후 수 ms 안에
@@ -1466,6 +1617,14 @@ class WsClientPool:
                         for i in range(max(1, n))]
         self._reaper = threading.Thread(target=self._reap_loop, daemon=True,
                                         name="ws-ack-reaper")
+        # ── ADR-022 sync_mode=mirror: 삭제 이벤트 전용 채널 ──
+        # 업로드 큐(_queues/_total/_maxsize)와 완전히 분리한다. 대량 로컬 삭제(작업자 폴더 정리)가
+        # 업로드 처리량을 잠식하면 ADR-019/2026-07-08 에서 확보한 속도 불변식을 어기게 되므로,
+        # 별도 상한 큐 + 별도 스레드로 격리한다. ack/원장 계약과 무관한 best-effort 채널 —
+        # 큐 포화·전송 실패는 드롭(경고 로그)하고 재시도하지 않는다(soft-delete 특성상 허용되는 손실).
+        self._deleted_q: "queue.Queue[str | None]" = queue.Queue(maxsize=100_000)
+        self._deleted_sender = threading.Thread(target=self._deleted_sender_loop, daemon=True,
+                                                 name="ws-deleted-sender")
 
     @staticmethod
     def _label_of(relpath: str) -> str:
@@ -1514,6 +1673,8 @@ class WsClientPool:
         with self._cv:
             if self._total >= self._maxsize:
                 self.mark_done(item[1])
+                # '보낸 것'으로 기억된 채 버려지면 보정 스캔도 건너뛴다 — 기억을 지워야 재수집된다.
+                self.runtime.forget_emitted(item[2])
                 self.request_rescan()
                 log.warning("재투입 큐 포화 (%s) — 보정 스캔으로 재수집 예정", item[1])
                 return
@@ -1557,30 +1718,93 @@ class WsClientPool:
             if pa is None or not self.runtime.ack_enabled:
                 continue
             expired = pa.expired()
+            requeued = handed_off = 0
             for relpath, ev_type, abspath in expired:
                 st = self.enqueue(ev_type, relpath, abspath)
                 if st == "full":
-                    self.request_rescan()
+                    # 여기서 버리면 '보낸 것'으로 기억된 채 보정 스캔도 건너뛴다 — 기억을 지운다.
+                    self.runtime.forget_emitted(abspath)
+                    handed_off += 1
+                else:
+                    requeued += 1
+            if handed_off:
+                self.request_rescan()
             if expired:
-                log.warning("ack 타임아웃 %d건 재전송 투입 (남은 대기 %d건)", len(expired), len(pa))
+                log.warning("ack 타임아웃 %d건 — 재전송 투입 %d건 / 큐 포화로 보정 스캔 위임 %d건 (남은 대기 %d건)",
+                            len(expired), requeued, handed_off, len(pa))
 
     def start(self) -> None:
         for c in self.clients:
             c.start()
         self._reaper.start()
-        log.info("WS 병렬 전송 활성: 연결 %d개 (폴더별 전용 큐·라운드로빈, 상한 %d, offer=%s)",
+        self._deleted_sender.start()
+        log.info("WS 병렬 전송 활성: 연결 %d개 (폴더별 전용 큐·라운드로빈, 상한 %d, offer=%s, sync_mode=%s)",
                  len(self.clients), self._maxsize,
-                 "on" if self.runtime.cfg.offer_enabled else "OFF(벌크 초기적재)")
+                 "on" if self.runtime.cfg.offer_enabled else "OFF(벌크 초기적재)",
+                 getattr(self.runtime.cfg, "sync_mode", "speed"))
 
     def stop(self) -> None:
         self._stop.set()
         with self._cv:
             self._cv.notify_all()   # 대기 중인 senders/enqueuers 깨워 종료시킨다
+        try:
+            self._deleted_q.put_nowait(None)
+        except queue.Full:
+            pass
         for c in self.clients:
             try:
                 c.stop()
             except Exception:  # noqa: BLE001
                 pass
+
+    def enqueue_deleted(self, relpath: str) -> None:
+        """ADR-022 sync_mode=mirror 전용: 로컬 삭제를 업로드 큐와 완전히 분리된 저우선순위
+        채널로 전송 큐에 투입. 대량 삭제가 업로드 처리량을 잠식하지 않는다(§2.5-4)."""
+        try:
+            self._deleted_q.put_nowait(relpath)
+        except queue.Full:
+            log.warning("삭제 이벤트 큐 포화 — 드롭(best-effort, 유실 허용): %s", relpath)
+
+    def _deleted_sender_loop(self) -> None:
+        """삭제 이벤트 전용 송신 루프. 연결된 아무 sender 로나 {"type":"deleted"} 텍스트 프레임만
+        보낸다(바이트 전송 없음 — 파일 큐/스로틀과 무관하게 가볍다). ack/원장 계약 밖의
+        best-effort 채널이라 실패해도 무손실 계약에 영향 없음 — 실패는 경고 로그 후 드롭."""
+        while not self._stop.is_set():
+            try:
+                relpath = self._deleted_q.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if relpath is None:
+                break
+            sent = False
+            for _ in range(10):  # 연결된 sender 를 짧게 재시도(최대 ~5초) — 재연결 중 유실 최소화
+                if self._stop.is_set():
+                    break
+                for c in self.clients:
+                    if c._connected.is_set():
+                        try:
+                            c._send_text({"type": "deleted", "path": relpath})
+                            sent = True
+                        except Exception as e:  # noqa: BLE001
+                            log.debug("삭제 이벤트 전송 실패(재시도 예정): %s — %s", relpath, e)
+                        break
+                if sent:
+                    break
+                self._stop.wait(0.5)
+            if not sent:
+                log.warning("삭제 이벤트 전송 포기(연결 없음, best-effort): %s", relpath)
+
+
+def _mirror_enqueue_deleted(cfg: "Config", ws_client, relpath: str) -> None:
+    """ADR-022 공통 게이트: sync_mode=mirror 일 때만 삭제 이벤트를 저우선순위 채널로 전송한다.
+    speed(기본)에서는 완전히 no-op — 기존 동작과 100% 동일. 실시간(watchdog, StabilityWorker.emit_deleted)
+    과 배치(원장 컴팩션 드롭, Rescanner) 양쪽에서 공통으로 호출되는 단일 진입점이라 두 경로의
+    동작이 항상 일치한다. ws_client 가 없거나(push/direct 모드) enqueue_deleted 를 지원하지 않으면
+    (구버전 풀 등) 조용히 무시 — 이 채널은 best-effort 라 실패해도 업로드 무손실 계약에 영향 없음."""
+    if getattr(cfg, "sync_mode", "speed") != "mirror":
+        return
+    if ws_client is not None and hasattr(ws_client, "enqueue_deleted"):
+        ws_client.enqueue_deleted(relpath)
 
 
 # ============================================================================
@@ -1609,7 +1833,7 @@ class StabilityWorker(threading.Thread):
         self._overflow_warned = 0.0
         self._stop = threading.Event()
 
-    def touch(self, abspath: str, ev_type: str) -> None:
+    def touch(self, abspath: str, ev_type: str, force: bool = False) -> None:
         if os.path.isdir(abspath):
             return
         if not self.cfg.file_allowed(abspath):
@@ -1621,18 +1845,28 @@ class StabilityWorker(threading.Thread):
         # 드물게 스캔 순간 쓰기 중인 파일이 섞여도 백엔드 크기 검증(불일치 폐기→재전송)과
         # 후속 modified 이벤트(안정화 경로)가 보정한다.
         if ev_type == "existing":
-            self._emit(abspath, ev_type)
+            self._emit(abspath, ev_type, force=force)
             return
         with self._lock:
             self._pending[abspath] = {"size": -1, "last_change": time.time(), "type": ev_type}
 
     def emit_deleted(self, abspath: str) -> None:
-        """적재 전용(ingest-only): 로컬 삭제는 어디에도 전송/반영하지 않는다.
-        pending/emitted 캐시만 정리해 동일 경로 재생성 시 새 파일로 다시 추적되게 한다."""
+        """캐시 정리는 항상 수행(동일 경로 재생성 시 새 파일로 다시 추적되게 함) — sync_mode 무관.
+        ADR-022: sync_mode=mirror 일 때만 삭제 이벤트를 저우선순위 채널로 백엔드에 전송한다.
+        speed(기본)에서는 기존과 100% 동일하게 아무 것도 전송하지 않는다(무시)."""
         with self._lock:
             self._pending.pop(abspath, None)
             self._emitted.pop(abspath, None)
-        log.debug("로컬 삭제 감지 — 무시(적재 전용): %s", abspath)
+        if getattr(self.cfg, "sync_mode", "speed") != "mirror":
+            log.debug("로컬 삭제 감지 — 무시(sync_mode=speed): %s", abspath)
+            return
+        if not self.cfg.file_allowed(abspath):
+            return  # 수집 조건 밖 파일의 삭제는 통지하지 않음(생성/수정과 동일 기준)
+        relpath = self.cfg.make_relpath(abspath)
+        if not relpath:
+            return  # 감시 폴더 밖
+        _mirror_enqueue_deleted(self.cfg, self.ws_client, relpath)
+        log.debug("삭제 이벤트 전송 큐 투입(sync_mode=mirror): %s", relpath)
 
     def stop(self) -> None:
         self._stop.set()
@@ -1672,7 +1906,7 @@ class StabilityWorker(threading.Thread):
         except OSError:
             return False
 
-    def _emit(self, abspath: str, ev_type: str) -> None:
+    def _emit(self, abspath: str, ev_type: str, force: bool = False) -> None:
         try:
             st = os.stat(abspath)
         except OSError:
@@ -1682,7 +1916,7 @@ class StabilityWorker(threading.Thread):
             return
         key = (st.st_size, int(st.st_mtime))
         with self._lock:
-            if self._emitted.get(abspath) == key:
+            if not force and self._emitted.get(abspath) == key:
                 return  # 동일 내용 재발행 방지
             self._emitted[abspath] = key
             while len(self._emitted) > self._EMITTED_MAX:
@@ -1691,7 +1925,7 @@ class StabilityWorker(threading.Thread):
         if not relpath:
             return  # 감시 폴더 밖이면 무시
         # ── 전송 원장 대조: 이미 적재 확인된 파일은 재전송하지 않음 (재부팅/재스캔 무손실·무중복) ──
-        if self.ledger is not None and self.ledger.has(relpath, st.st_size, st.st_mtime):
+        if not force and self.ledger is not None and self.ledger.has(relpath, st.st_size, st.st_mtime):
             return
         # ── ack 대기 중인 파일은 중복 투입하지 않음 ──
         if self.pending_acks is not None and self.pending_acks.contains(relpath):
@@ -1724,8 +1958,14 @@ class StabilityWorker(threading.Thread):
             self.push_client.enqueue(ev_type, relpath, abspath)
         # 직접 모드: 백엔드를 거치지 않고 SeaweedFS(S3) 에 바로 업로드. 성공 시 원장 기록.
         if self.s3_uploader is not None:
-            if self.s3_uploader.put(relpath, abspath) and self.ledger is not None:
-                self.ledger.record(relpath, st.st_size, st.st_mtime)
+            if self.s3_uploader.put(relpath, abspath):
+                if self.ledger is not None:
+                    self.ledger.record(relpath, st.st_size, st.st_mtime)
+            else:
+                # 실패한 파일을 '보낸 것'으로 기억하면 재기동 전까지 다시 올리지 않는다.
+                # 전수 재스캔을 곧바로 깨우지는 않는다(S3 장애 중 스캔 폭주 방지) — 주기 보정 스캔에 맡긴다.
+                with self._lock:
+                    self._emitted.pop(abspath, None)
 
     @staticmethod
     def _sha256(path: str) -> str:
@@ -1776,11 +2016,160 @@ class Runtime:
         self.pending_acks = PendingAcks(cfg.ack_timeout_seconds)  # ack 대기 레지스트리
         self.ack_enabled = False                              # welcome features 협상 결과
         self.rescan_event = threading.Event()                 # 보정 스캔 조기 트리거
+        self._last_reconcile_id = ""                         # mirror 전체 대조 명령 중복 제거
         self.worker: "StabilityWorker | None" = None
         self.observer = None  # watchdog Observer
         self.httpd = None          # AgentHTTPServer (listen 포트 동적 교체용)
         self.http_thread = None    # serve_forever 스레드
         self._lock = threading.Lock()
+        # 감시 범위가 확정됐는지. 백엔드가 감시 폴더를 내려주는 모드에서는 첫 set_watch_dirs 전까지
+        # 로컬 config 의 폴더가 임시값일 뿐이라, 그 기준으로 원장을 정리하면 멀쩡한 기록이 지워진다.
+        # main 에서 모드에 맞게 정한다(직접 모드 등은 처음부터 True).
+        self.scope_ready = True
+        # 백엔드가 '받을 노드 없음(unmatched)'으로 돌려보낸 파일 — 엣지가 켜지면 다시 보낸다.
+        self._unmatched: dict[str, str] = {}   # relpath -> abspath
+        self._unmatched_lock = threading.Lock()
+        self._unmatched_overflow = False
+        self._unmatched_logged = 0.0
+        self._unmatched_seen = 0                # 마지막 요약 로그 이후 새로 보류된 건수
+        self._last_full_retry = 0.0
+        self._unscheduled: list = []            # 실시간 감시를 걸지 못한 폴더(아직 없음 등)
+        self.app_dir = ""                       # 설치 폴더 — 여기 안에는 감시 폴더를 자동으로 만들지 않는다
+
+    # ---- 재전송 보조 ----
+    def forget_emitted(self, abspath: "str | None") -> None:
+        """이 파일을 '이미 발행함' 기억에서 지운다 → 다음 스캔 때 다시 발행된다."""
+        w = self.worker
+        if w is None or not abspath:
+            return
+        with w._lock:
+            w._emitted.pop(abspath, None)
+
+    def note_unmatched(self, relpath: str, abspath: "str | None") -> None:
+        """백엔드가 '받을 노드 없음' 등으로 돌려보낸 파일을 보류 목록에 둔다.
+
+        '보낸 것' 기억(_emitted)은 그대로 둔다 — 지우면 보정 스캔마다 같은 파일을 끝없이
+        다시 오퍼한다. 다시 보내는 때는 백엔드가 감시 구성을 새로 내려줄 때(엣지 활성화)다.
+        """
+        if not abspath:
+            return
+        now = time.time()
+        with self._unmatched_lock:
+            if len(self._unmatched) < 100_000:
+                self._unmatched[relpath] = abspath
+            else:
+                self._unmatched_overflow = True
+            self._unmatched_seen += 1
+            if now - self._unmatched_logged < 60:
+                return
+            self._unmatched_logged = now
+            seen, self._unmatched_seen = self._unmatched_seen, 0
+            pending = len(self._unmatched)
+        log.warning("받을 노드가 없어 보류 중인 파일 %d건 (최근 %d건 추가) — 캔버스 노드의 Token·WatchDir·"
+                    "엣지 활성화를 확인하세요. 엣지가 켜지면 자동으로 다시 보냅니다.", pending, seen)
+
+    def unmatched_count(self) -> int:
+        with self._unmatched_lock:
+            return len(self._unmatched)
+
+    def retry_unmatched(self) -> None:
+        """보류된 파일만 다시 발행한다. 백엔드는 set_watch_dirs 를 연결마다(최대 ws_senders 번) 보내므로
+        처음 받은 호출이 목록을 가져가고 나머지는 빈 목록으로 끝난다."""
+        now = time.time()
+        with self._unmatched_lock:
+            items = list(self._unmatched.values())
+            self._unmatched.clear()
+            overflow = self._unmatched_overflow
+            if overflow and now - self._last_full_retry < 600:
+                overflow = False          # 넘친 경우의 전체 재발행은 10분에 한 번만
+            if overflow:
+                self._unmatched_overflow = False
+                self._last_full_retry = now
+        worker = self.worker
+        if worker is None:
+            return
+        if overflow:
+            # 목록 상한을 넘겨 일부를 기억하지 못했다 — 전체 기억을 비우고 보정 스캔으로 다시 대조한다.
+            with worker._lock:
+                worker._emitted.clear()
+            log.info("보류 파일이 너무 많아 전체를 다시 대조합니다")
+            self.rescan_event.set()
+        if not items:
+            return
+        log.info("받을 노드가 없어 보류됐던 파일 %d건을 다시 보냅니다", len(items))
+
+        def _retry():
+            for ap in items:
+                if self.worker is not worker:
+                    return  # 감시 구성이 바뀌었다 — 새 구성의 초기 스캔이 다시 집는다
+                self.forget_emitted(ap)
+                worker.touch(ap, "existing")
+
+        threading.Thread(target=_retry, daemon=True, name="unmatched-retry").start()
+
+    def _schedule_watch(self, w) -> bool:
+        """이미 시작된 observer 에 폴더 하나를 건다. 실패하면 남은 흔적을 지우고 False.
+
+        watchdog 는 시작된 observer 에서만 schedule() 안에서 폴더를 연다. 그래서 observer 를
+        먼저 시작해 두고 폴더마다 따로 걸어야, 볼 수 없는 폴더 하나가 전체를 멈추지 않는다.
+        """
+        if not os.path.isdir(w.path):
+            return False
+        handler = _Handler(self.worker)
+        try:
+            self.observer.schedule(handler, w.path, recursive=w.recursive)
+            return True
+        except Exception as e:  # noqa: BLE001
+            log.warning("실시간 감시를 걸지 못했습니다(폴더가 보이면 자동 재시도): %s — %s", w.path, e)
+            try:
+                self.observer.remove_handler_for_watch(handler, ObservedWatch(w.path, recursive=w.recursive))
+            except Exception:  # noqa: BLE001
+                pass
+            return False
+
+    def schedule_pending_watches(self) -> None:
+        """부팅 때 없던(볼 수 없던) 감시 폴더가 보이면 실시간 감시를 건다(Rescanner 가 주기적으로 호출)."""
+        with self._lock:
+            if not self._unscheduled or self.observer is None or self.worker is None:
+                return
+            still = []
+            for w in self._unscheduled:
+                if self._schedule_watch(w):
+                    log.info("감시 시작(지연): %s — 이제 폴더가 보입니다", w.path)
+                    self.rescan_event.set()
+                else:
+                    still.append(w)
+            self._unscheduled = still
+
+    def unscheduled_paths(self) -> list[str]:
+        return [w.path for w in list(self._unscheduled)]
+
+    def reconcile_existing(self, reconcile_id: str) -> None:
+        """mirror Binding 활성화 시 현재 디렉터리 전체를 원장과 무관하게 1회 재제안한다.
+        같은 명령이 병렬 WS 연결마다 반복 수신돼도 reconcile_id로 중복 실행하지 않는다."""
+        reconcile_id = str(reconcile_id or "").strip()
+        if not reconcile_id:
+            return
+        with self._lock:
+            if reconcile_id == self._last_reconcile_id:
+                return
+            self._last_reconcile_id = reconcile_id
+            scan_worker = self.worker
+        if scan_worker is None:
+            return
+
+        def _scan():
+            scanned = 0
+            for _rel, ap_full, _size, _mtime in self.cfg.iter_existing():
+                if self.worker is not scan_worker:
+                    log.info("mirror 전체 대조 중단(감시 구성 교체) — %d개 투입", scanned)
+                    return
+                scan_worker.touch(ap_full, "existing", force=True)
+                scanned += 1
+            log.info("mirror 초기 전체 대조 완료: %d개 파일 재제안 (reconcileId=%s)",
+                     scanned, reconcile_id)
+
+        threading.Thread(target=_scan, daemon=True, name="mirror-reconcile").start()
 
     def attach_http_server(self, httpd, thread) -> None:
         """main 에서 띄운 HTTP 서버를 런타임이 관리하도록 등록(포트 동적 교체 위해)."""
@@ -1841,7 +2230,16 @@ class Runtime:
 
     def _start_unlocked(self) -> None:
         for w in self.cfg.watches:
-            os.makedirs(w.path, exist_ok=True)
+            if self.app_dir and _is_inside(w.path, self.app_dir):
+                # 설치 폴더 안에 폴더를 만들면 설치 폴더 권한 잠금이 막힌다(옛 기본값 C:/file-agent/watch).
+                if not os.path.isdir(w.path):
+                    log.warning("설치 폴더 안의 감시 폴더는 자동으로 만들지 않습니다: %s", w.path)
+                continue
+            try:
+                os.makedirs(w.path, exist_ok=True)
+            except OSError as e:
+                log.warning("감시 폴더를 지금은 만들 수 없습니다(나중에 다시 확인): %s — %s", w.path, e)
+        self._unscheduled = []
         self.worker = StabilityWorker(self.cfg, self.store, self.push_client, self.ws_client,
                                       self.s3_uploader, ledger=self.ledger,
                                       pending_acks=self.pending_acks,
@@ -1867,21 +2265,24 @@ class Runtime:
             threading.Thread(target=_initial_scan, daemon=True, name="initial-scan").start()
         # watch 폴더마다 observer.schedule → 한 Observer 가 여러 폴더 병렬 감시.
         # batch 폴더는 실시간 감시 없이 주기 스캔(Rescanner)으로만 수집한다.
+        # observer 를 먼저 시작한다 — 이후 schedule() 이 폴더를 바로 열어서, 볼 수 없는 폴더는
+        # 그 폴더만 실패한다(시작 전에 걸어 두면 start() 에서 한꺼번에 실패해 전체가 멈춘다).
         self.observer = Observer()
-        scheduled = 0
+        self.observer.start()
         for w in self.cfg.watches:
             if w.batch:
                 log.info("감시 시작(배치): %s (label=%s, interval=%.0fs — watchdog 미사용)",
                          w.path, w.label or "(none)",
                          w.batch_interval or self.cfg.rescan_interval_seconds or 60.0)
                 continue
-            self.observer.schedule(_Handler(self.worker), w.path, recursive=w.recursive)
-            scheduled += 1
+            if not self._schedule_watch(w):
+                if not os.path.isdir(w.path):
+                    log.warning("감시 폴더가 보이지 않습니다(보이면 자동으로 감시 시작): %s", w.path)
+                self._unscheduled.append(w)
+                continue
             flt = self.cfg.effective_filters(w)
             log.info("감시 시작: %s (label=%s, recursive=%s, 필터: %s)",
                      w.path, w.label or "(none)", w.recursive, flt.summary())
-        if scheduled:
-            self.observer.start()
 
     def stop(self) -> None:
         with self._lock:
@@ -1891,7 +2292,8 @@ class Runtime:
         if self.observer is not None:
             try:
                 self.observer.stop()
-                self.observer.join(timeout=5)
+                if self.observer.is_alive():
+                    self.observer.join(timeout=5)
             except Exception as e:  # noqa: BLE001
                 log.warning("observer 정지 실패(무시): %s", e)
             self.observer = None
@@ -1952,11 +2354,12 @@ class Runtime:
                 self.cfg.set_watches(specs)
                 if not self.cfg.watches:
                     raise ValueError("적용 가능한 감시 폴더가 없음")
-                for w in self.cfg.watches:
-                    os.makedirs(w.path, exist_ok=True)
+                # 폴더를 만들 수 없는 경우(네트워크 공유 미연결 등)는 _start_unlocked 가
+                # 경고만 남기고 나중에 다시 건다 — 백엔드가 정한 구성을 버리지 않는다.
                 self._start_unlocked()
             except Exception as e:  # noqa: BLE001
                 log.error("watch_dirs 적용 실패(%s) — 이전 감시 구성으로 복구", e)
+                self._stop_unlocked()   # 반쯤 만들어진 worker·observer 를 먼저 정리(스레드 누수 방지)
                 self.cfg.watches = prev_watches
                 self.cfg.watch_dir = prev_watch_dir
                 try:
@@ -1966,7 +2369,10 @@ class Runtime:
                 return {"status": "error", "reason": str(e), "watches": self.cfg.watch_summary()}
             summary = self.cfg.watch_summary()
             log.info("watch_dirs 변경 → %s", summary)
-            return {"status": "ok", "watches": summary}
+            result = {"status": "ok", "watches": summary}
+            if self._unscheduled:
+                result["unscheduled"] = self.unscheduled_paths()
+            return result
 
     def apply_watch_spec(self, raw: str, recursive: bool | None = None) -> dict:
         """watchDir 문자열 적용. ';' 로 구분된 여러 폴더면 다중 감시(폴더명 prefix),
@@ -2017,7 +2423,7 @@ class ConfigPoller(threading.Thread):
         req = urllib.request.Request(self.url, method="GET")
         if self.token:
             req.add_header("X-Agent-Token", self.token)
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with _url_open(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8") or "{}")
 
         # listen 포트 / advertise host 동기화 (노드 Port/Address → 데몬에 동적 적용)
@@ -2073,12 +2479,16 @@ class Rescanner(threading.Thread):
         super().__init__(daemon=True, name="rescanner")
         self.cfg = cfg
         self.runtime = runtime
-        self._stop = threading.Event()
+        # threading.Thread 에는 내부용 _stop() 메서드가 있어 같은 이름을 쓰면 is_alive() 가 깨진다.
+        self._stop_evt = threading.Event()
         self._next_run: dict[str, float] = {}   # watch.path -> 다음 실행 시각
+        self._last_end: dict[str, float] = {}   # watch.path -> 마지막 스캔 종료 시각
         self._last_compact: float = 0.0         # 원장 컴팩션 마지막 실행 시각(ADR-019)
+        self.last_scan_at: float = 0.0          # /health 표시용
+        self.last_loop_at: float = 0.0
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_evt.set()
 
     def _interval_for(self, w: "Watch") -> float:
         if w.batch:
@@ -2089,42 +2499,72 @@ class Rescanner(threading.Thread):
         log.info("보정/배치 스캐너 시작 (기본 주기 %.0fs, 큐 포화 시 조기 기동)",
                  self.cfg.rescan_interval_seconds)
         # 시작 직후엔 emit_existing_on_start 가 이미 1회 스캔했으므로 주기만큼 대기 후 시작.
-        while not self._stop.is_set():
+        while not self._stop_evt.is_set():
             triggered = self.runtime.rescan_event.wait(timeout=5.0)
-            if self._stop.is_set():
+            if self._stop_evt.is_set():
                 break
             if triggered:
                 self.runtime.rescan_event.clear()
-            now = time.time()
-            worker = self.runtime.worker
-            if worker is None:
+            self.last_loop_at = time.time()
+            try:
+                self._tick(triggered)
+            except Exception as e:  # noqa: BLE001  스캐너가 죽으면 배치 수집·보정이 조용히 멈춘다
+                log.error("보정/배치 스캔 중 오류(다음 주기에 계속): %s", e, exc_info=True)
+
+    def _tick(self, triggered: bool) -> None:
+        now = time.time()
+        worker = self.runtime.worker
+        if worker is None:
+            return
+        self.runtime.schedule_pending_watches()
+        # 배치 폴더(유일한 수집 경로)를 실시간 폴더의 보정 스캔보다 먼저 처리한다.
+        for w in sorted(list(self.cfg.watches), key=lambda x: 0 if x.batch else 1):
+            iv = self._interval_for(w)
+            if iv <= 0 and not triggered:
+                continue  # 보정 스캔 꺼짐 (배치 아님 + interval=0)
+            base_iv = iv if iv > 0 else 60.0
+            # 첫 만남에 '다음 실행 시각'을 저장해 둔다. get 으로만 읽으면 매번 now+주기로
+            # 다시 계산돼 영원히 도래하지 않는다(= 주기 보정 스캔이 한 번도 안 돌던 결함).
+            due = self._next_run.setdefault(w.path, now + base_iv)
+            if triggered:
+                if now < self._last_end.get(w.path, 0.0) + 60.0:
+                    continue  # 조기 기동이 잦아도 같은 폴더를 1분 안에 다시 훑지 않는다
+            elif now < due:
                 continue
-            for w in list(self.cfg.watches):
-                iv = self._interval_for(w)
-                if iv <= 0 and not triggered:
-                    continue  # 보정 스캔 꺼짐 (배치 아님 + interval=0)
-                due = self._next_run.get(w.path, now + (iv if iv > 0 else 60.0))
-                if not triggered and now < due:
-                    continue
-                self._next_run[w.path] = now + (iv if iv > 0 else 60.0)
-                scanned = 0
-                for _relpath, ap, _size, _mtime in self.cfg.iter_existing(only=w):
-                    if self.runtime.worker is not worker or self._stop.is_set():
-                        break  # 감시 구성 교체/종료 — 이번 스캔 양보
-                    worker.touch(ap, "existing")
-                    scanned += 1
-                log.info("%s 스캔: %s — %d개 파일 대조 투입 (미적재분만 전송됨)",
-                         "배치" if w.batch else "보정", w.path, scanned)
-            # 보정 스캔 뒤 원장 컴팩션(ADR-019): 스코프 밖/디스크에 없는 항목 제거.
-            #   rescan_interval(최소 60s)마다 1회로 제한 — 잦은 트리거에도 과다 실행 방지.
-            _lg = getattr(self.runtime, "ledger", None)
-            if self.cfg.ledger_compaction and _lg is not None:
-                if now - self._last_compact >= max(self.cfg.rescan_interval_seconds, 60.0):
-                    self._last_compact = now
-                    try:
-                        _lg.compact(self.cfg.resolve)
-                    except Exception as _e:  # noqa: BLE001
-                        log.warning("원장 주기 컴팩션 실패(무시): %s", _e)
+            started = time.time()
+            scanned = 0
+            for _relpath, ap, _size, _mtime in self.cfg.iter_existing(only=w):
+                if self.runtime.worker is not worker or self._stop_evt.is_set():
+                    break  # 감시 구성 교체/종료 — 이번 스캔 양보
+                worker.touch(ap, "existing")
+                scanned += 1
+            ended = time.time()
+            took = ended - started
+            # 다음 실행은 '끝난 시각' 기준. 스캔이 주기보다 오래 걸리는 큰 폴더는 소요시간의 3배를 쉰다.
+            self._next_run[w.path] = ended + max(base_iv, took * 3)
+            self._last_end[w.path] = ended
+            self.last_scan_at = ended
+            log.info("%s 스캔: %s — %d개 파일 대조 (%.1f초, 다음 %.0f초 뒤, 미적재분만 전송)",
+                     "배치" if w.batch else "보정", w.path, scanned, took,
+                     self._next_run[w.path] - ended)
+        # 보정 스캔 뒤 원장 컴팩션(ADR-019): 스코프 밖/디스크에 없는 항목 제거.
+        #   rescan_interval(최소 60s)마다 1회로 제한 — 잦은 트리거에도 과다 실행 방지.
+        _lg = getattr(self.runtime, "ledger", None)
+        if self.cfg.ledger_compaction and _lg is not None and self.runtime.scope_ready:
+            if self._last_compact == 0.0:
+                # 첫 정리는 한 주기 뒤로 미룬다 — 기동 직후엔 네트워크 폴더가 덜 붙었을 수 있다.
+                self._last_compact = now
+            elif now - self._last_compact >= max(self.cfg.rescan_interval_seconds, 60.0):
+                self._last_compact = now
+                try:
+                    # ADR-022: sync_mode=mirror 면 디스크에서 사라진 항목을 삭제 이벤트로도 통지 —
+                    # collect_mode=batch 처럼 watchdog 이 없어 on_deleted 를 못 받는 폴더의 유일한
+                    # 삭제 감지 경로. speed(기본)에서는 on_dropped 가 즉시 no-op.
+                    _lg.compact(self.cfg.resolve_for_compaction,
+                                on_dropped=lambda rp: _mirror_enqueue_deleted(
+                                    self.cfg, self.runtime.ws_client, rp))
+                except Exception as _e:  # noqa: BLE001
+                    log.warning("원장 주기 컴팩션 실패(무시): %s", _e)
 
 
 # ============================================================================
@@ -2156,6 +2596,23 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         supplied = self.headers.get("X-Agent-Token") or (qs.get("token", [""])[0])
         return hmac.compare_digest(str(supplied), cfg.token)
 
+    def _remote_allowed(self, path: str) -> bool:
+        """다른 PC 에서 온 요청을 받아도 되는 경로인지.
+
+        백엔드 WS 모드·직접 모드에서는 파일을 이 데몬이 내보내므로, 원격에서 파일을 읽거나
+        감시 폴더를 바꿀 일이 없다. 이때 원격에는 /health(백엔드의 도달성 점검)만 연다.
+        데몬은 SYSTEM 권한이라, 토큰이 새면 /control 로 감시 폴더를 바꾼 뒤 /files 로
+        아무 파일이나 읽을 수 있기 때문이다. 옛 PULL 모드는 백엔드가 원격으로
+        /events·/files·/control 을 부르므로 그대로 둔다.
+        """
+        ip = str(self.client_address[0] if self.client_address else "")
+        if ip.startswith("127.") or ip in ("::1", "::ffff:127.0.0.1"):
+            return True
+        runtime = getattr(self.server, "runtime", None)
+        pull_mode = (runtime is not None and runtime.ws_client is None
+                     and runtime.s3_uploader is None and runtime.push_client is None)
+        return pull_mode or path == "/health"
+
     def _json(self, code: int, obj) -> None:
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
@@ -2169,6 +2626,9 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         path = parsed.path.rstrip("/") or "/"
         qs = parse_qs(parsed.query)
 
+        if not self._remote_allowed(path):
+            self._json(403, {"error": "local only", "path": path})
+            return
         if not self._authorized(qs):
             self._json(401, {"error": "unauthorized"})
             return
@@ -2186,11 +2646,21 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
                 "watch_dirs": cfg.watch_summary(),   # 다중 폴더 목록
                 "recursive": cfg.recursive,
                 "last_seq": store.last_seq,
+                # 재부팅 뒤 자동 실행 확인용: 이 프로세스가 언제 떴는지와 그때의 부팅 시각
+                "pid": os.getpid(),
+                "started_at": round(_PROCESS_STARTED_AT, 1),
+                "boot_at": round(_boot_epoch(), 1),
             }
             if runtime is not None:
                 body["ledger_size"] = len(runtime.ledger) if runtime.ledger else 0
                 body["pending_acks"] = len(runtime.pending_acks) if runtime.pending_acks else 0
                 body["ack_mode"] = runtime.ack_enabled
+                body["unmatched"] = runtime.unmatched_count()
+                body["unwatched_dirs"] = runtime.unscheduled_paths()
+                rs = getattr(runtime, "rescanner", None)
+                if rs is not None:
+                    body["rescanner_alive"] = rs.is_alive()
+                    body["last_scan_at"] = rs.last_scan_at
             self._json(200, body)
         elif path == "/list":
             self._json(200, {"files": self._list_files(cfg)})
@@ -2216,6 +2686,9 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         path = parsed.path.rstrip("/") or "/"
         qs = parse_qs(parsed.query)
 
+        if not self._remote_allowed(path):
+            self._json(403, {"error": "local only", "path": path})
+            return
         if not self._authorized(qs):
             self._json(401, {"error": "unauthorized"})
             return
@@ -2231,6 +2704,15 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
                 body = json.loads(raw.decode("utf-8") or "{}")
             except Exception as e:  # noqa: BLE001
                 self._json(400, {"error": "bad json", "detail": str(e)})
+                return
+            specs = body.get("watch_dirs")
+            if isinstance(specs, list) and specs:
+                # 목록 형태(UI): 문자열·dict 항목을 그대로 적용 — 라벨·폴더별 필터가 유지된다.
+                try:
+                    self._json(200, runtime.swap_watches(specs))
+                except Exception as e:  # noqa: BLE001
+                    log.error("swap_watches 실패: %s", e)
+                    self._json(500, {"error": "swap failed", "detail": str(e)})
                 return
             new_dir = (body.get("watch_dir") or "").strip()
             if not new_dir:
@@ -2374,6 +2856,24 @@ def apply_log_config(cfg) -> None:
              cfg.log_level, cfg.log_max_mb, cfg.log_backups + 1, cfg.log_max_mb * (cfg.log_backups + 1))
 
 
+def _is_inside(path: str, folder: str) -> bool:
+    try:
+        a = os.path.normcase(os.path.realpath(path))
+        b = os.path.normcase(os.path.realpath(folder))
+        return os.path.commonpath([a, b]) == b
+    except (ValueError, OSError):
+        return False
+
+
+def _thread_excepthook(hook_args) -> None:
+    """스레드가 예외로 죽으면 조용히 사라지지 않게 로그에 남긴다."""
+    if hook_args.exc_type is SystemExit:
+        return
+    name = getattr(hook_args.thread, "name", "?")
+    log.error("스레드 %s 가 예외로 멈췄습니다", name,
+              exc_info=(hook_args.exc_type, hook_args.exc_value, hook_args.exc_traceback))
+
+
 def app_dir() -> str:
     # PyInstaller 단일 exe 로 묶였을 때도 "실행 파일 옆" 경로를 쓰기 위함
     if getattr(sys, "frozen", False):
@@ -2392,10 +2892,19 @@ _singleton_handle = None  # 잠금 핸들/파일을 살려두는 전역 참조
 
 
 def acquire_single_instance(port: int) -> bool:
-    """같은 포트로 실행 중인 인스턴스가 없으면 잠금을 잡고 True, 이미 있으면 False.
-    잠금 자체를 만들 수 없는 환경 오류는 '막지 않음'(True) 으로 보수적으로 처리한다."""
+    """실행 중인 인스턴스가 없으면 잠금을 잡고 True, 이미 있으면 False.
+
+    ★ 한 PC 에 데몬은 하나만 둔다 — 포트가 달라도 공존시키지 않는다(2026-09-16 변경).
+      이전에는 포트별 뮤텍스라 둘 이상이 동시에 떴는데, 그러면
+        · 같은 폴더에서 돌 때 원장(sent.jsonl)을 함께 써서 무손실이 깨지고
+        · token 이 같으면 백엔드가 양쪽에 set_watch_dirs 를 보내 같은 파일을 이중 전송한다.
+      여기서 False 가 나면 호출부가 _kill_other_instances() 로 기존 것을 정리하고 교체한다.
+
+    잠금 자체를 만들 수 없는 환경 오류는 fail-closed(False) 로 처리해 중복 실행을 막는다.
+    """
     global _singleton_handle
-    name = f"file-agent-port-{int(port)}"
+    del port  # 더 이상 포트로 가르지 않는다(호출부 호환 위해 인자만 유지).
+    name = "file-agent-singleton"
     if os.name == "nt":
         import ctypes
         from ctypes import wintypes
@@ -2406,8 +2915,13 @@ def acquire_single_instance(port: int) -> bool:
         handle = kernel32.CreateMutexW(None, False, f"Global\\{name}")
         last = kernel32.GetLastError()
         if not handle:
-            log.warning("단일 인스턴스 뮤텍스 생성 실패(중복검사 건너뜀): err=%s", last)
-            return True
+            # 예약 작업(SYSTEM)과 수동 실행(일반 사용자)은 Global mutex의 기본
+            # DACL이 달라 Open/Create가 ERROR_ACCESS_DENIED(5)로 실패할 수 있다.
+            # 이때 실행을 허용하면 SYSTEM 인스턴스와 사용자 인스턴스가 동시에
+            # 떠서 동일 파일을 중복 전송한다. 접근 거부는 기존 mutex가 존재하는
+            # 것으로 fail-closed 처리하고, 그 외 오류도 안전하게 실행을 막는다.
+            log.error("단일 인스턴스 뮤텍스 획득 실패 — 새 인스턴스 실행 차단: err=%s", last)
+            return False
         if last == ERROR_ALREADY_EXISTS:
             kernel32.CloseHandle(handle)
             return False
@@ -2433,7 +2947,7 @@ def acquire_single_instance(port: int) -> bool:
     return True
 
 
-def _kill_other_instances() -> None:
+def _kill_other_instances(port: int = 0) -> None:
     """자기 자신을 제외한 모든 file-agent.exe 프로세스를 강제 종료 (Windows 전용).
     좀비/멈춤 인스턴스가 뮤텍스·포트를 쥐고 있어도 새 실행이 자리를 차지할 수 있게 한다.
     ※ PyInstaller onefile 은 부트로더(부모)+본체(자식) 한 쌍으로 뜨므로,
@@ -2447,57 +2961,183 @@ def _kill_other_instances() -> None:
             parent = os.getppid()
         except OSError:
             parent = 0
-        cmd = ["taskkill", "/F", "/T", "/IM", "file-agent.exe", "/FI", f"PID ne {me}"]
-        if parent:
-            cmd += ["/FI", f"PID ne {parent}"]
-        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
-        msg = ((r.stdout or "") + (r.stderr or "")).strip().replace("\r\n", " / ")
-        log.info("기존 인스턴스 정리: %s", msg or f"rc={r.returncode}")
+        keep = {0, me, parent}
+        # (1) 이름 기준 — file-agent.exe + file-agent.new.exe(배포 스테이징 이름)
+        for image in ("file-agent.exe", "file-agent.new.exe"):
+            cmd = ["taskkill", "/F", "/T", "/IM", image, "/FI", f"PID ne {me}"]
+            if parent:
+                cmd += ["/FI", f"PID ne {parent}"]
+            r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+            msg = ((r.stdout or "") + (r.stderr or "")).strip().replace("\r\n", " / ")
+            if msg:
+                log.info("기존 인스턴스 정리(이름=%s): %s", image, msg)
+        # (2) 포트 기준 — 지정 포트를 LISTEN 중인 옛 에이전트(개발용 python 실행 포함) 종료.
+        #     포트는 '로컬 주소' 칸의 끝자리와 정확히 비교한다 — 부분 문자열로 찾으면
+        #     876 이 8765 에 걸린다. 그리고 에이전트로 볼 수 없는 프로그램은 건드리지 않는다
+        #     (같은 포트를 쓰는 남의 서비스를 죽이지 않도록).
+        if port and int(port) > 0:
+            nr = subprocess.run(["netstat", "-ano", "-p", "TCP"],
+                                capture_output=True, text=True, errors="replace")
+            want = str(int(port))
+            pids = set()
+            for line in (nr.stdout or "").splitlines():
+                parts = line.split()
+                if len(parts) < 5 or parts[3].upper() != "LISTENING":
+                    continue
+                if parts[1].rsplit(":", 1)[-1] != want:
+                    continue
+                try:
+                    pid = int(parts[-1])
+                except ValueError:
+                    continue
+                if pid not in keep:
+                    pids.add(pid)
+            for pid in list(pids):
+                tr = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                                    capture_output=True, text=True, errors="replace")
+                image = (tr.stdout or "").strip().split(",", 1)[0].strip('"').lower()
+                if not (image.startswith("file-agent") or image.startswith("python")) \
+                        or image.startswith("file-agent-ui"):
+                    log.warning("포트 %s 를 다른 프로그램(%s, PID %s)이 쓰고 있어 건드리지 않습니다.",
+                                want, image or "?", pid)
+                    pids.discard(pid)
+            for pid in pids:
+                kr = subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                                    capture_output=True, text=True, errors="replace")
+                log.info("기존 인스턴스 정리(포트 %s, PID %s): %s", int(port), pid,
+                         ((kr.stdout or "") + (kr.stderr or "")).strip().replace("\r\n", " / "))
     except Exception as e:  # noqa: BLE001
         log.warning("기존 인스턴스 정리 실패(무시): %s", e)
 
 
-# 기본 config 템플릿 — config.json 이 없으면 첫 실행 시 이 내용으로 생성한다(편집해서 사용).
+# 기본 config 템플릿 — config.json 도 config.template.json 도 없을 때만 쓴다(배포본에는 템플릿 파일이 있다).
 DEFAULT_CONFIG_JSON = """{
-  // ★ 모드 선택 — 이 한 줄로 결정: "direct" 또는 "backend"
-  "mode": "direct",
-
-  // ===================== 공통 =====================
-  // 감시할 폴더. 둘 중 하나만 쓰면 됨:
-  //  (1) 단일 폴더  : "watch_dir": "C:/file-agent/watch"   (prefix 없음)
-  //  (2) 여러 폴더  : "watch_dirs": ["C:/test", "C:/khk"]  (폴더명 자동 prefix → test/..., khk/...)
-  //     라벨/recursive 개별 지정도 가능:
-  //     "watch_dirs": [{"dir":"C:/test","label":"raw","recursive":true}, {"dir":"C:/khk"}]
-  "watch_dir": "C:/file-agent/watch",
-  // "watch_dirs": ["C:/test", "C:/khk"],
-  "token": "change-me-please-long-random-token",
-  "port": 8765,
-
-  // ===== mode=="backend" 일 때만 사용 =====
-  "ws_url": "http://10.1.55.225:3940",  // 백엔드 주소
-
-  // ===== mode=="direct" 일 때만 사용 =====
-  "s3_endpoint": "http://10.1.55.225:28333",
-  "s3_bucket": "noteTest",
+  // config.template.json 과 같은 키·값(주석만 짧음). 두 파일이 어긋나지 않게 함께 고친다.
+  "mode": "backend",                  // "backend" = TERESA MQ 백엔드 경유 | "direct" = S3 직접 업로드
+  "watch_dirs": [],                   // backend 모드에서는 캔버스 노드의 WatchDir 가 우선
+  "token": "change-me-please-long-random-token",   // file-agent-ui.exe 의 [새 토큰 생성] 으로 바꾼다
+  "port": 8765,                       // 이 PC 에서 여는 포트(백엔드 포트 아님)
+  "ws_senders": 48,
+  "ws_send_timeout": 60,
+  "offer_enabled": true,
+  "ledger_compaction": true,
+  "ledger_keep_in_memory": 5000000,
+  "rescan_interval_seconds": 3600,
+  "sync_mode": "speed",
+  "ack_timeout_seconds": 3600,
+  "log_level": "INFO",
+  "log_max_mb": 50,
+  "log_backups": 10,
+  "ws_url": "",                       // backend 모드: 접속할 백엔드 주소 (이 PC 의 주소가 아님)
+  "s3_endpoint": "",                  // direct 모드 전용
+  "s3_bucket": "",
   "s3_access_key": "",
-  "s3_secret_key": ""
+  "s3_secret_key": "",
+  "s3_path_prefix": ""
 }
 """
 
+CONFIG_TEMPLATE_NAME = "config.template.json"
+
 
 def ensure_config(path: str) -> bool:
-    """config.json 이 없으면 기본 템플릿으로 생성. 생성했으면 True."""
+    """config.json 이 없으면 옆의 config.template.json(없으면 내장 템플릿)으로 만든다. 만들었으면 True."""
     if os.path.isfile(path):
         return False
     try:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        template = os.path.join(os.path.dirname(os.path.abspath(path)), CONFIG_TEMPLATE_NAME)
+        if os.path.isfile(template):
+            with open(template, encoding="utf-8-sig") as f:
+                body = f.read()
+        else:
+            body = DEFAULT_CONFIG_JSON
         with open(path, "w", encoding="utf-8") as f:
-            f.write(DEFAULT_CONFIG_JSON)
-        log.info("기본 config.json 생성: %s — watch_dir/token/(직접모드면 s3_*) 편집하세요.", path)
+            f.write(body)
+        log.info("config.json 생성: %s — file-agent-ui.exe 로 주소·토큰·감시 폴더를 설정하세요.", path)
         return True
     except OSError as e:
         log.error("config.json 생성 실패 %s: %s", path, e)
         return False
+
+
+def token_problem(token: str) -> str:
+    """토큰을 쓸 수 없는 이유. 쓸 수 있으면 ""."""
+    t = (token or "").strip()
+    if not t:
+        return "토큰이 비어 있습니다"
+    if t == PLACEHOLDER_TOKEN:
+        return "토큰이 배포 기본값 그대로입니다"
+    return ""
+
+
+def startup_problem(cfg: "Config") -> str:
+    """기존 데몬을 건드리기 전에 확인하는 설정 오류. 문제가 없으면 "".
+
+    토큰은 모든 모드에서 본다. 데몬은 SYSTEM 권한이라, 비었거나 공개된 기본값이면
+    이 PC 의 일반 사용자가 127.0.0.1 로 붙어 감시 폴더를 바꾸고 아무 파일이나 읽을 수 있다.
+    """
+    tp = token_problem(cfg.token)
+    if tp:
+        return (tp + " — file-agent-ui.exe 「연결」 탭에서 [새 토큰 생성] 후 저장하세요 "
+                "(backend 모드면 캔버스 노드의 Token 도 같은 값으로)")
+    if cfg.s3_direct_enabled:
+        if not (cfg.s3_endpoint and cfg.s3_bucket):
+            return "direct 모드인데 s3_endpoint 또는 s3_bucket 이 비어 있습니다"
+        return ""
+    if cfg.ws_enabled or cfg.mode == "backend":
+        url = (cfg.ws_url or "").strip()
+        if not url:
+            return "백엔드 모드인데 백엔드 주소(ws_url)가 비어 있습니다"
+        try:
+            p = urlparse(url if "://" in url else "http://" + url)
+            _ = p.port   # 포트가 숫자가 아니거나 범위를 벗어나면 ValueError
+        except ValueError as e:
+            return f"백엔드 주소 형식이 잘못됐습니다 ({url}): {e}"
+        if p.scheme not in ("http", "https", "ws", "wss") or not p.hostname:
+            return f"백엔드 주소 형식이 잘못됐습니다 ({url})"
+    if cfg.push_enabled and not cfg.push_url:
+        return "push_enabled=true 인데 push_url 이 비어 있습니다"
+    return ""
+
+
+def _boot_epoch() -> float:
+    """이번 부팅 시각(epoch 초). 알 수 없으면 0."""
+    try:
+        if os.name == "nt":
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            k32.GetTickCount64.restype = ctypes.c_uint64
+            return time.time() - k32.GetTickCount64() / 1000.0
+        with open("/proc/uptime", encoding="ascii") as f:
+            return time.time() - float(f.read().split()[0])
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def user_stop_active(base: str) -> bool:
+    """UI [중지] 표식이 이번 부팅에 만든 것이면 True. 지난 부팅 것이면 지우고 False."""
+    path = os.path.join(base, STOP_FLAG_NAME)
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.loads(f.read() or "{}")
+    except FileNotFoundError:
+        return False
+    except Exception:  # noqa: BLE001
+        data = {}
+    try:
+        flag_boot = float(data.get("boot", 0) or 0)
+    except (TypeError, ValueError, AttributeError):
+        flag_boot = 0.0
+    now_boot = _boot_epoch()
+    if flag_boot and now_boot and abs(now_boot - flag_boot) < 120:
+        return True
+    try:
+        os.remove(path)
+        log.info("지난 부팅 때의 [중지] 표식을 지웠습니다 — 자동 실행을 재개합니다.")
+    except OSError:
+        pass
+    return False
 
 
 def ensure_firewall_port(port: int) -> None:
@@ -2550,8 +3190,71 @@ def _run_powershell(script: str) -> int:
         return 2
 
 
+def _ps_q(value: str) -> str:
+    """PowerShell 작은따옴표 문자열 안에 넣을 값. 경로에 ' 가 있어도 깨지지 않게 두 번 쓴다."""
+    out = str(value)
+    for q in ("'", "\u2018", "\u2019", "\u201a", "\u201b"):
+        out = out.replace(q, q + q)
+    return out
+
+
+def _harden_install_dir_ps() -> str:
+    """설치 폴더 권한 잠금용 PowerShell 조각($work 사용). 실패해도 설치는 계속하고 결과를 출력한다.
+
+    SYSTEM 작업이 실행하는 exe 를 일반 사용자가 바꿔치기하면 곧바로 SYSTEM 권한을 얻는다.
+    C:\\file-agent 같은 폴더는 기본으로 'Authenticated Users 수정 가능'이라 막아야 한다.
+      · 폴더: SYSTEM·Administrators 모든 권한. Users 는 폴더 열람만((CI)RX — 파일에는 상속 안 됨).
+      · 파일: 새로 생기는 파일(로그·원장·설정)은 SYSTEM·Administrators 만 읽는다.
+              실행에 필요한 exe·bat·템플릿·BUILD-INFO 에만 Users 읽기/실행을 따로 준다.
+      · OWNER RIGHTS 를 읽기/실행으로 제한 — 압축을 푼 일반 사용자가 소유자여도 권한을 바꿀 수 없다.
+      · 소유자는 Administrators (폴더와 바로 아래 파일만 — 하위 폴더는 재귀하지 않는다).
+      · 하위 폴더가 있으면(옛 기본 감시 폴더 등) 먼저 현재 권한을 고정(/inheritance:d)해,
+        그 폴더에 쓰는 프로그램은 그대로 쓸 수 있게 한다.
+    icacls 오류는 로컬 EAP=Continue 에서 2>&1 로 받아 결과에 남긴다(PS 5.1 에서 EAP=Stop 과 섞지 않는다).
+    """
+    return (
+        "& {"
+        "$ErrorActionPreference='Continue';"
+        "$fail=@();"
+        "foreach($d in @(Get-ChildItem -LiteralPath $work -Directory -Force -ErrorAction SilentlyContinue)){"
+        "$o=& icacls.exe $d.FullName /inheritance:d 2>&1 | ForEach-Object {\"$_\"};"
+        "if($LASTEXITCODE -ne 0){$fail+=('하위 폴더 '+$d.Name+': '+($o -join ' '))}"
+        "else{Write-Host ('acl: 하위 폴더 권한 고정 — '+$d.Name)}"
+        "};"
+        "$o=& icacls.exe $work /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F'"
+        " '*S-1-5-32-545:(CI)RX' '*S-1-3-4:(OI)(CI)RX' 2>&1 | ForEach-Object {\"$_\"};"
+        "if($LASTEXITCODE -ne 0){$fail+=('폴더: '+($o -join ' '))}"
+        "$o=& icacls.exe $work /setowner '*S-1-5-32-544' 2>&1 | ForEach-Object {\"$_\"};"
+        "if($LASTEXITCODE -ne 0){$fail+=('폴더 소유자: '+($o -join ' '))}"
+        "foreach($f in @(Get-ChildItem -LiteralPath $work -File -Force -ErrorAction SilentlyContinue)){"
+        "$o=& icacls.exe $f.FullName /setowner '*S-1-5-32-544' 2>&1 | ForEach-Object {\"$_\"};"
+        "if($LASTEXITCODE -ne 0){$fail+=('소유자 '+$f.Name+': '+($o -join ' '))}"
+        "if(@('.exe','.bat') -contains $f.Extension.ToLower() -or @('config.template.json','BUILD-INFO.txt') -contains $f.Name){"
+        "$o=& icacls.exe $f.FullName /grant '*S-1-5-32-545:RX' 2>&1 | ForEach-Object {\"$_\"};"
+        "if($LASTEXITCODE -ne 0){$fail+=('실행 권한 '+$f.Name+': '+($o -join ' '))}"
+        "}"
+        "};"
+        "foreach($n in @('config.json','config.json.bak')){"
+        "$f=Join-Path $work $n;"
+        "if(Test-Path -LiteralPath $f){$o=& icacls.exe $f /inheritance:r /grant:r '*S-1-5-18:F' '*S-1-5-32-544:F' 2>&1 | ForEach-Object {\"$_\"};"
+        "if($LASTEXITCODE -ne 0){$fail+=($n+': '+($o -join ' '))}}"
+        "};"
+        "if($fail.Count -gt 0){Write-Host ('WARN acl: 설치 폴더 잠금 일부 실패(NTFS 로컬 디스크인지 확인) — '+($fail -join ' / '))}"
+        "else{Write-Host 'acl: 설치 폴더를 관리자 전용 쓰기로 잠갔습니다'}"
+        "};"
+    )
+
+
 def self_install(task_name: str, port: int) -> int:
-    """exe 자기 자신을 방화벽 허용 + 작업 스케줄러(로그인 시 시작, 죽으면 재시작)에 등록 후 시작."""
+    """exe 자기 자신을 방화벽 허용 + 작업 스케줄러에 등록하고 시작한다.
+
+    트리거 세 개:
+      · 부팅 시(30초 지연) — 로그인하지 않아도 수집 시작
+      · 로그인 시
+      · 5분마다 — 데몬이 죽어 있으면 다시 띄운다. 작업 스케줄러의 '실패 시 다시 시작'은
+        프로세스가 오류 코드로 끝난 경우에는 동작하지 않기 때문이다(2026-09-17 이 PC 에서 확인).
+        이미 떠 있으면 IgnoreNew 로 무시되고, 작업 밖에서 뜬 데몬이 있으면 --from-task 인스턴스가 양보한다.
+    """
     if not getattr(sys, "frozen", False):
         log.error("--install 은 빌드된 file-agent.exe 에서만 동작합니다.")
         return 2
@@ -2559,33 +3262,49 @@ def self_install(task_name: str, port: int) -> int:
     work = os.path.dirname(exe)
     ps = (
         "$ErrorActionPreference='Stop';"
-        f"$exe='{exe}'; $work='{work}'; $port={int(port)}; $task='{task_name}';"
+        f"$exe='{_ps_q(exe)}'; $work='{_ps_q(work)}'; $port={int(port)}; $task='{_ps_q(task_name)}';"
+        + _harden_install_dir_ps() +
         "if(-not (Get-NetFirewallRule -DisplayName $task -ErrorAction SilentlyContinue)){"
         "New-NetFirewallRule -DisplayName $task -Direction Inbound -Protocol TCP -LocalPort $port -Action Allow | Out-Null};"
-        "$a=New-ScheduledTaskAction -Execute $exe -WorkingDirectory $work;"
-        # 부팅 시(AtStartup) + 로그인 시(AtLogOn) 둘 다 트리거 → 로그인 안 해도 부팅하면 자동 수집 시작.
-        "$t1=New-ScheduledTaskTrigger -AtStartup;"
+        "$a=New-ScheduledTaskAction -Execute $exe -Argument '--from-task' -WorkingDirectory $work;"
+        # AtStartup 은 30초 늦춘다 — 부팅 직후엔 네트워크·디스크가 아직 안 올라와 첫 기동이 헛돌기 쉽다.
+        "$t1=New-ScheduledTaskTrigger -AtStartup; $t1.Delay='PT30S';"
         "$t2=New-ScheduledTaskTrigger -AtLogOn;"
-        "$s=New-ScheduledTaskSettingsSet -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew;"
+        "$at=(Get-Date).AddMinutes(5); $iv=New-TimeSpan -Minutes 5;"
+        # Windows 10 이상은 기간을 비우면 '무기한'. 옛 버전은 기간이 필수라 10년으로 준다.
+        "try{$t3=New-ScheduledTaskTrigger -Once -At $at -RepetitionInterval $iv}"
+        "catch{$t3=New-ScheduledTaskTrigger -Once -At $at -RepetitionInterval $iv -RepetitionDuration ([TimeSpan]::FromDays(3650))};"
+        # 기본값은 배터리 전환 시 작업 중지·배터리 부팅 시 미기동·우선순위 7(낮음)이다.
+        # 노트북·UPS 현장에서 수집이 멈추지 않도록 전원 조건을 풀고 우선순위를 보통(4)으로 올린다.
+        "$s=New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries"
+        " -Priority 4 -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)"
+        " -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew;"
         # SYSTEM 계정 + Highest: 로그인 없이 부팅 시 관리자 권한으로 실행(방화벽 제어 가능).
         "$p=New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest;"
-        "Register-ScheduledTask -TaskName $task -Action $a -Trigger @($t1,$t2) -Settings $s -Principal $p -Description 'TERESA MQ file-agent' -Force | Out-Null;"
+        "Register-ScheduledTask -TaskName $task -Action $a -Trigger @($t1,$t2,$t3) -Settings $s -Principal $p"
+        " -Description 'TERESA MQ file-agent (boot + logon + 5min watchdog)' -Force | Out-Null;"
         "Start-ScheduledTask -TaskName $task;"
         "Write-Host ('installed: '+$task+' (port '+$port+')')"
     )
     rc = _run_powershell(ps)
     if rc != 0:
-        log.error("설치 실패 — 관리자 권한 PowerShell 에서 다시 실행하세요.")
+        log.error("설치 실패 — 관리자 권한으로 다시 실행하세요.")
     return rc
 
 
 def self_uninstall(task_name: str) -> int:
-    """작업 스케줄러 등록 + 방화벽 룰 제거."""
+    """작업 스케줄러 등록 + 방화벽 룰 제거.
+
+    방화벽 룰은 두 종류다 — 설치 때 만든 '<task>' 와, 관리자 권한으로 돈 데몬이
+    ensure_firewall_port() 로 만든 '<task>-<포트>'. 둘 다 지운다.
+    """
     ps = (
-        f"$task='{task_name}';"
+        f"$task='{_ps_q(task_name)}';"
         "try{Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue}catch{};"
         "try{Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue}catch{};"
-        "try{Get-NetFirewallRule -DisplayName $task -ErrorAction SilentlyContinue | Remove-NetFirewallRule}catch{};"
+        "try{Get-NetFirewallRule -ErrorAction SilentlyContinue | "
+        "Where-Object { $_.DisplayName -eq $task -or $_.DisplayName -match ('^'+[regex]::Escape($task)+'-\\d+$') } | "
+        "Remove-NetFirewallRule}catch{};"
         "Write-Host ('uninstalled: '+$task)"
     )
     return _run_powershell(ps)
@@ -2606,26 +3325,55 @@ def main() -> int:
     ap.add_argument("--no-replace", action="store_true",
                     help="기존 인스턴스가 있으면 교체하지 않고 종료 (기본: 기존 것을 정리하고 새로 시작)")
     ap.add_argument("--task-name", default="file-agent", help="작업 스케줄러 이름 (기본 file-agent)")
+    # 작업 스케줄러가 붙이는 표시. 이때는 사용자의 [중지]를 존중하고, 이미 떠 있는 데몬에 양보한다.
+    ap.add_argument("--from-task", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     setup_logging(os.path.join(base, "agent.log"))
+    threading.excepthook = _thread_excepthook
 
     # 셀프 설치/제거: exe 한 개만으로 등록 가능
     if args.uninstall:
         return self_uninstall(args.task_name)
     if args.install:
-        ensure_config(args.config)              # 설치 시 config 없으면 기본 생성
-        # 방화벽에 열 포트: --port 우선, 없으면 config.json 의 port (노드 Port 와 맞춰둔 값).
-        port = args.port
-        if not port:
-            try:
-                with open(args.config, encoding="utf-8") as f:
-                    # 주석(JSONC) config 도 읽도록 _strip_jsonc 사용
-                    port = int(json.loads(_strip_jsonc(f.read())).get("port", 8765))
-            except Exception:  # noqa: BLE001
-                port = 8765
-        log.info("설치: 방화벽에 TCP %s 허용 (config.json/노드 Port 와 동일해야 함)", port)
+        ensure_config(args.config)              # 설치 시 config 없으면 템플릿으로 생성
+        try:
+            install_cfg = Config.load(args.config)
+        except Exception as e:  # noqa: BLE001
+            log.error("설치 중단 — config.json 을 읽을 수 없습니다: %s", e)
+            return 2
+        # 부팅 작업은 인자 없이 config.json 만 읽는다 — 설치 때 CLI 로 다른 값을 주면 등록 뒤에 어긋난다.
+        if args.token and args.token != install_cfg.token:
+            log.error("설치 중단 — --token 이 config.json 의 토큰과 다릅니다. UI 에서 저장한 뒤 다시 켜세요.")
+            return 2
+        if args.port and args.port != install_cfg.port:
+            log.error("설치 중단 — --port 가 config.json 의 port 와 다릅니다. UI 에서 저장한 뒤 다시 켜세요.")
+            return 2
+        install_cfg.finalize_watches()
+        problem = startup_problem(install_cfg)
+        if problem:
+            # 이대로 등록하면 부팅·5분마다 시작 거부만 반복한다. 공개된 기본 토큰도 여기서 막는다.
+            log.error("설치 중단 — %s", problem)
+            return 2
+        if os.path.abspath(base).startswith("\\\\"):
+            log.error("설치 중단 — 네트워크 경로(%s)에는 설치할 수 없습니다. 로컬 디스크에 두세요.", base)
+            return 2
+        port = install_cfg.port or 8765
+        try:
+            os.remove(os.path.join(base, STOP_FLAG_NAME))   # 켜기 = 다시 돌게 하겠다는 뜻
+        except OSError:
+            pass
+        log.info("설치: 방화벽에 TCP %s 허용", port)
         return self_install(args.task_name, port)
+
+    held_instance = False
+    if args.from_task:
+        if user_stop_active(base):
+            return 0
+        # 5분 감시: 이미 돌고 있으면 설정을 읽거나 폴더를 만들기 전에 조용히 끝낸다.
+        if not acquire_single_instance(0):
+            return 0
+        held_instance = True
 
     # 첫 실행도 그냥 되도록: config 없으면 기본 템플릿 자동 생성
     ensure_config(args.config)
@@ -2659,26 +3407,44 @@ def main() -> int:
 
     # watch_dirs 미지정 시 단일 watch_dir 로 watches 채움(라벨 "" = prefix 없음, 하위호환)
     cfg.finalize_watches()
-    if not cfg.watches:
-        log.error("감시 폴더가 없습니다. config.json 의 watch_dir 또는 watch_dirs 를 지정하세요.")
+
+    # ★ 설정 오류는 기존 데몬을 정리하기 '전에' 거른다. 잘못된 exe 를 실수로 실행해도
+    #   정상 운영 중인 데몬을 죽이고 자기도 종료해 버리는 일이 없게 한다.
+    problem = startup_problem(cfg)
+    if problem:
+        log.error("시작하지 않습니다 — %s", problem)
         return 2
-    for w in cfg.watches:
-        os.makedirs(w.path, exist_ok=True)
+    backend_driven = (not cfg.s3_direct_enabled
+                      and (cfg.ws_enabled or cfg.mode == "backend" or cfg.push_enabled))
+    if not cfg.watches:
+        if not backend_driven:
+            log.error("감시 폴더가 없습니다. config.json 의 watch_dir 또는 watch_dirs 를 지정하세요.")
+            return 2
+        log.info("감시 폴더는 백엔드 캔버스 노드가 내려줍니다 — 연결되면 감시를 시작합니다.")
+    # 감시 폴더 생성은 Runtime 이 한다(볼 수 없는 폴더는 경고만, 설치 폴더 안은 만들지 않음).
     if not cfg.token:
-        log.warning("token 이 비어 있습니다. 포트가 무인증으로 열립니다(보안상 권장하지 않음).")
+        log.warning("token 이 비어 있습니다. 이 PC 안에서는 무인증으로 접근됩니다(권장하지 않음).")
+    for w in cfg.watches:
+        if _is_inside(w.path, base):
+            log.warning("감시 폴더가 설치 폴더 안에 있습니다(%s). 설치 폴더 밖으로 옮기는 것을 권장합니다.", w.path)
 
     # 중복 실행 방지 + 교체 시작(기본): 같은 포트로 이미 떠 있으면
     #  - 기본 동작: 기존 인스턴스(좀비/멈춤 포함)를 강제 종료하고 이 인스턴스가 자리를 차지한다.
     #    → "exe 더블클릭 = 항상 깨끗한 재시작". 뮤텍스는 OS 가 프로세스 종료 시 자동 해제.
     #  - --no-replace 지정 시: 기존처럼 이 인스턴스가 양보하고 종료.
     #  ※ 기존 인스턴스가 SYSTEM(스케줄러) 권한이면 일반 권한으로는 못 죽일 수 있음
-    #     → 그 경우 관리자 권한(에이전트_재시작.bat, UAC 승인)이 필요하다고 로그에 남긴다.
-    if not acquire_single_instance(cfg.port):
+    #     → 그 경우 file-agent-ui.exe 의 [다시 시작](관리자)을 쓰라고 로그에 남긴다.
+    if not held_instance and not acquire_single_instance(cfg.port):
+        if args.from_task:
+            # 5분 감시 트리거: 이미 누군가 돌고 있으면 건드리지 않는다.
+            log.debug("이미 실행 중인 데몬이 있어 자동 실행 점검만 하고 끝냅니다.")
+            return 0
         if args.no_replace:
-            log.error("이미 같은 포트(%d)로 file-agent 가 실행 중입니다. (--no-replace) 이 인스턴스는 종료합니다.", cfg.port)
+            log.error("이미 file-agent 가 실행 중입니다(포트 무관 — 한 PC 에 하나만 허용). "
+                      "(--no-replace) 이 인스턴스는 종료합니다.")
             return 3
         log.warning("기존 인스턴스 감지 — 교체 시작: 이전 file-agent 프로세스를 정리합니다.")
-        _kill_other_instances()
+        _kill_other_instances(cfg.port)
         acquired = False
         for _ in range(20):  # 최대 10초 대기 (뮤텍스/포트 해제)
             time.sleep(0.5)
@@ -2687,7 +3453,7 @@ def main() -> int:
                 break
         if not acquired:
             log.error("기존 인스턴스를 정리하지 못했습니다(권한 부족 가능성). "
-                      "'에이전트_재시작.bat'을 관리자 권한(UAC 예)으로 실행하세요.")
+                      "file-agent-ui.exe 의 [다시 시작]을 쓰거나 관리자 권한으로 실행하세요.")
             return 3
         log.info("교체 완료 — 새 인스턴스로 계속합니다.")
 
@@ -2700,18 +3466,28 @@ def main() -> int:
         log.info("감시 디렉터리: %s (recursive=%s)", cfg.watch_dir, cfg.recursive)
     log.info("HTTP 노출: http://%s:%d", cfg.host, cfg.port)
 
+    store = EventStore(os.path.join(base, "events.jsonl"))
+    # 포트를 먼저 잡는다 — 다른 프로그램이 쓰고 있으면 원장·전송을 시작하기 전에 분명한 오류로 끝낸다.
+    try:
+        httpd = AgentHTTPServer((cfg.host, cfg.port), cfg, store, runtime=None)
+    except OSError as e:
+        log.error("시작하지 않습니다 — 포트 %s:%d 를 열 수 없습니다(다른 프로그램이 사용 중?): %s",
+                  cfg.host, cfg.port, e)
+        return 2
+
     # 시작 시 현재 listen 포트를 방화벽에 자동 허용(관리자 권한일 때만 성공).
     ensure_firewall_port(cfg.port)
 
-    store = EventStore(os.path.join(base, "events.jsonl"))
     # 전송 완료 원장: 재부팅/서버 다운 후에도 "적재 확인된 파일"을 기억해 차등 전송.
     #   메모리 보관 상한은 config(ledger_keep_in_memory) — 동시 보관 파일 수보다 크게.
     ledger = SentLedger(os.path.join(base, "sent.jsonl"), keep_in_memory=cfg.ledger_keep_in_memory)
     # 기동 시 원장 컴팩션(ADR-019): 스코프 밖/디스크에 없는 항목 제거 → 시작메모리·디스크 상한.
     # (워커 시작 전이라 append 경쟁 없음. cfg.finalize_watches 는 위에서 이미 수행됨.)
-    if cfg.ledger_compaction:
+    # 백엔드가 감시 폴더를 정하는 모드에서는 지금 폴더 목록이 임시값이라 여기서 정리하지 않는다 —
+    # 첫 set_watch_dirs 를 받은 뒤 Rescanner 가 정리한다.
+    if cfg.ledger_compaction and not backend_driven:
         try:
-            _kept, _dropped = ledger.compact(cfg.resolve)
+            _kept, _dropped = ledger.compact(cfg.resolve_for_compaction)
             log.info("원장 시작 컴팩션: 유지 %d / 제거 %d", _kept, _dropped)
         except Exception as _e:  # noqa: BLE001
             log.warning("원장 시작 컴팩션 실패(무시): %s", _e)
@@ -2739,6 +3515,10 @@ def main() -> int:
 
     # Runtime 이 observer/worker 를 보유 → /control/watch_dir 로 런타임 교체 가능
     runtime = Runtime(cfg, store, push_client, s3_uploader=s3_uploader, ledger=ledger)
+    runtime.scope_ready = not backend_driven
+    runtime.app_dir = base
+    if push_client is not None:
+        push_client.on_fail = runtime.forget_emitted
 
     # WS 모드: backend 와 양방향 WebSocket. (직접모드면 생략)
     # ws_client 는 runtime(명령 처리용)이 필요하고 runtime.start() 전에 주입해야 worker 가 ws 로도 enqueue 한다.
@@ -2762,6 +3542,7 @@ def main() -> int:
 
     # 배치 수집 + 보정 스캔 스레드 (무중단·무손실 보조 경로)
     rescanner = Rescanner(cfg, runtime)
+    runtime.rescanner = rescanner
     rescanner.start()
 
     # PUSH 모드: backend 에서 watch_dir 를 폴링해 동적 적용 (외부망 데몬도 UI 에서 dir 변경 가능)
@@ -2770,7 +3551,7 @@ def main() -> int:
         config_poller = ConfigPoller(cfg.push_url, cfg.token, runtime)
         config_poller.start()
 
-    httpd = AgentHTTPServer((cfg.host, cfg.port), cfg, store, runtime=runtime)
+    httpd.runtime = runtime
     server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     server_thread.start()
     # 런타임이 HTTP 서버를 관리하도록 등록 → 노드 Port 변경 시 swap_listen 으로 동적 재바인딩.
@@ -2813,5 +3594,21 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
-# v1.2.0 — 수집 필터(파일명/확장자/용량)·전송원장(ack)·배치/보정 스캔 추가
+    try:
+        sys.exit(main())
+    except Exception:  # noqa: BLE001  (SystemExit·KeyboardInterrupt 는 그대로 통과)
+        # --noconsole exe 에서 처리 안 된 예외가 나면 PyInstaller 부트로더가 오류 창을 띄우고 멈춘다.
+        # SYSTEM 계정으로 부팅할 때는 그 창을 누를 사람이 없어 프로세스가 영원히 대기한다.
+        # 로그에 남기고 끝낸다 — 작업 스케줄러의 5분 감시 트리거가 다시 띄운다.
+        import traceback as _tb
+        _msg = _tb.format_exc()
+        try:
+            log.error("기동 실패 — 처리되지 않은 예외\n%s", _msg)
+        except Exception:  # noqa: BLE001
+            pass
+        try:  # 로깅 설정 전에 터졌을 수도 있으니 파일에도 남긴다
+            with open(os.path.join(app_dir(), "agent-crash.log"), "a", encoding="utf-8") as _f:
+                _f.write("[%s]\n%s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), _msg))
+        except Exception:  # noqa: BLE001
+            pass
+        sys.exit(1)

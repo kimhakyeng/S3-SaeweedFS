@@ -12,11 +12,16 @@ dist/
 dist_new/
 *.exe
 *.zip
+*.zip.sha256
+*.zip.manifest.json
 *.pkg
 *.spec
+quarantine/
 
 # ===== 생성된 테스트 이미지 / 로그 =====
 *.png
+# 단, UI 로고는 빌드 입력이므로 추적한다
+!assets/*.png
 img_*.png
 log/
 Images/
@@ -27,6 +32,18 @@ ram_log.txt
 # ===== 중복 클론 폴더 (file-agent 자체가 저장소이므로 제외) =====
 S3-SaeweedFS/
 
+# ===== 운영 config (실 secret 포함 — 커밋 금지) =====
+config.json
+
 # ===== OS =====
 .DS_Store
 Thumbs.db
+
+# ===== 설치 폴더에 생기는 운영 파일 (배포 시험 중 저장소에 섞이지 않게) =====
+sent.jsonl*
+stopped.flag
+agent-crash.log
+agent.log.*
+config.json.bak
+config.json.broken-*
+*.tmp
